@@ -1,0 +1,1719 @@
+---
+title: "Two_States_Two_Periods"
+output: html_document
+---
+
+
+Two states, treated state and control state. $s =0$ for control and $s=1$ for treated. Each state has $N$ counties.
+Two periods, $t=0$ not treated and $t=1$ treated.
+
+Here is the model for $y_{jst}$. Basically, there are three key ingredients in this model: two random effects(county random effects $\gamma_j$ and time random effects $\delta$), group-level predictors $\bar{X}_{s[j]}$, and treatment effects.
+
+
+The group-level predictors capture the group varying intercept and the county random effects $\gamma_j$ accounts for the individual heterogenity not explained by the group-level predictors. $\lambda$ represents the time trend we need to model. In this two-period example, $\lambda$ is just a number. In a longer panel, $\lambda_t$ is a series of numbers could be modeled by iid normal.
+
+
+$$
+y_{jst}= A_0+ A_1^\top \bar{X}_{s[j]} + \gamma_j + \lambda I_{t=1} + \delta_j Z_{jst} + \epsilon_{jst} 
+$$
+
+Put usual normal prior on the regression coefficients $A_1$ and intercept $A_0$. Hierarchical normal prior on $\gamma_j$ and $\gamma_j$ has different mean and variance for different groups. Normal prior on $\delta_j$. Normal prior on $\lambda$. 
+
+
+$\epsilon_{jst}$ are all iid normal(0,$\sigma_{y}^2$). 
+
+
+Implement five different estimates:
+
+1. Event Study. Take difference between the mean of treated states from time $1$ and time $0$.
+
+
+$\bar{y}_{s=1,t=1} - \bar{y}_{s=1, t=0} = \bar\delta + \lambda + \bar{\epsilon}_{s=1,t=1} - \bar{\epsilon}_{s=1,t=0}\sim\mathcal{N}(\bar{\delta} + \lambda, \dfrac{2\sigma_{y}^2}{N}) $
+
+2. Difference-in-mean. Take difference between the mean of treated states from time $1$ and mean of control states from time $1$
+
+$$
+\begin{equation}
+\begin{aligned}
+&\bar{y}_{s=1,t=1} - \bar{y}_{s=0, t=1} 
+\\ = &  \bar\delta + A_1^\top (\bar{X}_{s=1} - \bar{X}_{s=0}) + \bar{\gamma}_{s=1} - \bar{\gamma}_{s=0} + \bar{\epsilon}_{s=1,t=1} - \bar{\epsilon}_{s=0,t=1}\\
+\sim & \mathcal{N}(\bar\delta + A_1^\top (\bar{X}_{s=1} - \bar{X}_{s=0}) + \bar{\gamma}_{s=1} - \bar{\gamma}_{s=0}\;,\; \dfrac{2\sigma_{y}^2}{N}) 
+\end{aligned}
+\end{equation}
+$$
+
+
+3. DiD
+
+$$
+\begin{equation}
+\begin{aligned}
+& (\bar{y}_{s=1,t=1} - \bar{y}_{s=1, t=0}) - (\bar{y}_{s=0,t=1} - \bar{y}_{s=0, t=0}) \\
+& = \bar\delta  + \bar{\epsilon}_{s=1,t=1} - \bar{\epsilon}_{s=1,t=0} - (\bar{\epsilon}_{s=0,t=1} - \bar{\epsilon}_{s=0,t=0})\\
+& \sim\mathcal{N}(\bar{\delta} , \dfrac{4\sigma_{y}^2}{N}) 
+\end{aligned}
+\end{equation}
+$$
+
+
+4. Regression DiD controlling for something need to be figured out.
+
+
+
+5. Bayesian DiD.
+
+We expect that conditional on the hyperparameters the Bayesian DiD estimate should be of form of the something subtracted by weighted $\lambda_t$(time trend) and $\bar{\gamma}_{s=1} - \bar{\gamma}_{s=0}$ and $ A_1^\top (\bar{X}_{s=1} - \bar{X}_{s=0})$(the group level variation).
+
+
+
+```{r}
+# =========================
+# Libraries
+# =========================
+library(cmdstanr)
+library(posterior)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+
+# =========================
+# Compile Stan once
+# =========================
+stan_file <- "Two_States_Two_Periods.stan"
+mod <- cmdstan_model(stan_file)
+```
+
+$$
+y_{jst}= A_0+ A_1^\top \bar{X}_{s[j]} + A_2^\top X_j + \gamma_j + \lambda_t + \delta_j Z_{jst} + \epsilon_{jst} 
+$$
+
+
+```{r simulate data}
+# 2×2: one treated state (s=1), one control (s=0)
+simulate_data_2x2_one_group_predictor <- function(N_per_state=40, K=1,
+                                 A0=0.0, A1=0.4,
+                                 Xbar = matrix(c(-0.5, 0.8), nrow=2, byrow=TRUE),
+                                 u_1 = 1, u_0 = 0,
+                                 sigma_c_treat=1.0, sigma_c_ctrl=0.6,
+                                 # treatment & time
+                                 lambda=0.5, mu_delta=3.0, sigma_delta=1.6,
+                                 sigma_y=1.0, seed=1L){
+  set.seed(seed)
+  S <- 2L; J_t <- N_per_state; J_c <- N_per_state; J <- J_t + J_c
+  is_treated <- c(rep(1L,J_t), rep(0L,J_c))
+  state_of_county <- c(rep(1L,J_t), rep(2L,J_c))
+  state_is_treated <- c(1L,0L)
+
+  # truth: u_s and c_j by state group
+  u <- c(u_0, u_1)
+  c <- numeric(J)
+  c[is_treated==1L] <- rnorm(J_t,0,sigma_c_treat)
+  c[is_treated==0L] <- rnorm(J_c,0,sigma_c_ctrl)
+
+  # deltas (treated counties only)
+  delta <- rep(0,J)
+  delta[is_treated==1L] <- rnorm(J_t, mu_delta, sigma_delta)
+
+  # panel rows
+  county <- rep(seq_len(J), each=2)
+  post   <- rep(c(0L,1L), times=J)
+  D      <- is_treated[county]*post
+  s_row  <- state_of_county[county]
+
+  A1_vec <- if (length(A1)==1) rep(A1,K) else as.numeric(A1)
+  
+  lin_x  <- rowSums(Xbar[s_row,,drop=FALSE] *
+                    matrix(A1_vec, nrow=length(s_row), ncol=K, byrow=TRUE))
+  mu <- A0 + lin_x + u[s_row] + c[county] + lambda*post + delta[county]*D
+  y  <- rnorm(length(mu), mu, sigma_y)
+
+  list(
+    stan_data = list(
+      N=length(y), J=J, S=2L, K=K, y=y,
+      county=as.integer(county), post=as.integer(post), D=as.integer(D),
+      state_of_county=as.integer(state_of_county),
+      Xbar=Xbar,
+      is_treated=as.integer(is_treated),
+      state_is_treated=as.integer(state_is_treated),
+      J_treated=J_t, treated_idx=as.integer(which(is_treated==1L)),
+      center_c=0L,
+      pool_u_within_group=0L,     # 2×2: no pooling across groups
+      big_sd_u=10             # diffuse prior per state
+    ),
+    truth = list(
+      A0=A0, A1=A1_vec, Xbar=Xbar, lambda=lambda, sigma_y=sigma_y,
+      u=u, c=c, is_treated=is_treated, delta=delta,
+      mu_delta=mu_delta, sigma_delta=sigma_delta
+    )
+  )
+}
+```
+
+
+```{r}
+library(cmdstanr)
+library(posterior)
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+# Classical ATT estimators (+ Wald CIs under homoskedastic σ_y)
+att_classical <- function(y, county, post, state, sigma_y, N_per_state){
+  y_11 <- mean(y[state==1 & post==1]); y_10 <- mean(y[state==1 & post==0])
+  y_01 <- mean(y[state==0 & post==1]); y_00 <- mean(y[state==0 & post==0])
+  ES  <- y_11 - y_10
+  DM  <- y_11 - y_01
+  DiD <- (y_11 - y_10) - (y_01 - y_00)
+  z <- qnorm(0.975)
+  ES_se  <- sqrt(2 * sigma_y^2 / N_per_state)
+  DM_se  <- sqrt(2 * sigma_y^2 / N_per_state)
+  DiD_se <- sqrt(4 * sigma_y^2 / N_per_state)
+  tibble(
+    method = c("ES","DM","DiD"),
+    est    = c(ES, DM, DiD),
+    lo     = c(ES - z*ES_se,  DM - z*DM_se,  DiD - z*DiD_se),
+    hi     = c(ES + z*ES_se,  DM + z*DM_se,  DiD + z*DiD_se)
+  )
+}
+
+# Per-county DiD for treated counties (analytic CI under σ_y)
+per_county_did <- function(y, county, post, state, sigma_y, N_per_state, treated_ids){
+  y_c1 <- mean(y[state==0 & post==1]); y_c0 <- mean(y[state==0 & post==0])
+  y_first_difference_control <- y_c1 - y_c0
+  z <- qnorm(0.975)
+  se_dj <- sqrt(2*sigma_y^2 + 2*sigma_y^2/N_per_state)
+  map_dfr(treated_ids, function(j){
+    y_j1 <- y[county==j & post==1]; y_j0 <- y[county==j & post==0]
+    dj <- (y_j1 - y_j0) - y_first_difference_control
+    tibble(county=j, est=dj, lo=dj - z*se_dj, hi=dj + z*se_dj)
+  })
+}
+```
+
+# Bayesian DiD via cmdstanr
+
+```{r}
+# ---- one-time: pick a durable folder for chain CSVs ----
+.default_outdir <- file.path(getwd(), "cmdstan_out")
+if (!dir.exists(.default_outdir)) dir.create(.default_outdir, recursive = TRUE)
+
+fit_bayes_once <- function(stan_data,
+                           treated_idx  = NULL, # will try stan_data$treated_idx if NULL
+                           delta_name   = "delta",
+                           iter_warmup  = 500,
+                           iter_sampling= 1000,
+                           chains       = 4,
+                           parallel_chains = chains,
+                           seed         = 2025,
+                           output_dir   = .default_outdir,
+                           refresh      = 0) {
+  
+  # --- resolve treated indices ---
+  if (is.null(treated_idx)) {
+    treated_idx <- stan_data$treated_idx %||% stan_data$treated_ids
+    if (is.null(treated_idx)) stop("Provide treated_idx or include $treated_idx in stan_data.")
+  }
+  treated_idx <- as.integer(treated_idx)
+  J1 <- length(treated_idx)
+
+  # --- unique chain ids to avoid filename collisions ---
+  chain_ids <- seq_len(chains)
+
+  # --- run sampler with pinned output_dir ---
+  
+  outdir <- file.path(getwd(), "cmdstan_out")
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  stopifnot(all(is.finite(unlist(stan_data))))
+
+  fit <- mod$sample(
+    data = stan_data,
+    chains = chains, parallel_chains = chains,
+    iter_warmup = iter_warmup, iter_sampling = iter_sampling,
+    refresh = 0, show_messages = FALSE,output_dir = outdir,
+  save_cmdstan_config = TRUE,   # <- key
+  save_warmup = TRUE,           # optional
+  output_basename = "run1",    # optional: stable filenames
+  seed = seed
+  )
+
+  # --- check CSVs exist & chains returned 0 ---
+  csvs <- fit$output_files(include_failed = TRUE)
+  if (!all(file.exists(csvs))) {
+    message("Some chain CSVs are missing:\n", paste(csvs[!file.exists(csvs)], collapse = "\n"))
+  }
+  rc <- fit$return_codes()
+  if (any(rc != 0L) || !all(file.exists(csvs))) {
+    # print stderr/stdout paths to help debug
+    std_out <- fit$stdout_files()
+    diag_files <- fit$diagnostic_files()
+    message("Nonzero return codes: ", paste(rc, collapse = ", "))
+    message("Stdout files:\n", paste(std_out, collapse = "\n"))
+    message("Diagnostic files:\n", paste(diag_files, collapse = "\n"))
+    # Try a safer rerun (single chain) to surface the underlying error
+    message("Retrying with chains=1, parallel_chains=1, refresh=0 to surface messages...")
+    
+    stopifnot(all(is.finite(unlist(stan_data))))
+
+    fit <- mod$sample(
+      data = stan_data,
+      seed = seed + 1L,
+      chains = 1,
+      parallel_chains = 1,
+      chain_ids = 1,
+      iter_warmup = iter_warmup,
+      iter_sampling = iter_sampling,
+      refresh = 0,
+      show_messages = FALSE,
+      output_dir = output_dir
+    )
+  }
+
+  # --- extract delta draws ONLY (avoid delta_raw) ---
+  adapt_delta = 0.9
+  
+  dr_delta <- posterior::as_draws_df(fit$draws(variables = delta_name))
+  delta_cols <- grep(paste0("^", delta_name, "\\[[0-9]+\\]$"),
+                     names(dr_delta), value = TRUE)
+  if (length(delta_cols) == 0) {
+    stop("No columns found for parameter '", delta_name, "'. Check Stan variable names.")
+  }
+
+  j_stan <- as.integer(sub(paste0("^", delta_name, "\\[([0-9]+)\\]$"), "\\1", delta_cols))
+  ord <- order(j_stan)
+  delta_cols <- delta_cols[ord]; j_stan <- j_stan[ord]
+  Delta_mat <- as.matrix(dr_delta[, delta_cols, drop = FALSE])
+
+  # --- handle two cases: delta over ALL counties vs TREATED-only ---
+  if (!is.null(stan_data$J) && length(j_stan) == stan_data$J) {
+    pos_treat <- match(treated_idx, j_stan)
+    if (anyNA(pos_treat)) {
+      stop("Some treated_idx are not present among indices of '", delta_name, "'.")
+    }
+    Delta_tr <- Delta_mat[, pos_treat, drop = FALSE]
+    county_labels <- treated_idx
+  } else if (length(j_stan) == J1 && all(j_stan == seq_len(J1))) {
+    # Stan stored delta only for treated counties
+    Delta_tr <- Delta_mat
+    county_labels <- treated_idx
+  } else {
+    stop("Dimension mismatch: ", delta_name, " has ", length(j_stan),
+         " entries; expected J (all) or J1 (treated).")
+  }
+
+  # --- per-county posteriors (treated only) ---
+  delta_mean <- colMeans(Delta_tr)
+  delta_sd   <- apply(Delta_tr, 2, stats::sd)
+  delta_l95  <- apply(Delta_tr, 2, stats::quantile, probs = 0.025)
+  delta_u95  <- apply(Delta_tr, 2, stats::quantile, probs = 0.975)
+  
+
+  delta_tbl <- tibble::tibble(
+    j   = as.integer(county_labels),
+    est = as.numeric(delta_mean),
+    sd  = as.numeric(delta_sd),
+    lo  = as.numeric(delta_l95),
+    hi  = as.numeric(delta_u95)
+  )
+
+  # --- ATT from the same draws (coherent) ---
+  ATT_draws <- rowMeans(Delta_tr)
+  ATT_mean  <- mean(ATT_draws)
+  ATT_ci    <- stats::quantile(ATT_draws, c(0.025, 0.975), names = FALSE)
+
+  
+  list(
+    ATT = list(mean = ATT_mean, lo = ATT_ci[1], hi = ATT_ci[2], draws = ATT_draws),
+    delta = delta_tbl,
+    output_files = fit$output_files()
+  )
+}
+```
+
+
+```{r}
+quick_compare <- function(R = 50, N_per_state = 40, K = 1,
+                          A0 = 0.0, A1 = 0.4,
+                          Xbar = matrix(c(-0.5, 0.8), nrow = 2, byrow = TRUE),
+                          u_1 = 1, u_0 = 0,
+                          sigma_c_treat = 1.0, sigma_c_ctrl = 0.7,
+                          lambda = 2, mu_delta = 1.0, sigma_delta = 0.6,
+                          sigma_y = 1.0, seed0 = 1234,
+                          iter_warmup = 500, iter_sampling = 500, chains = 2) {
+  # Storage for results. Lists of data.frames/tibbles
+  ATT_rows   <- vector("list", R)
+  DELTA_rows <- vector("list", R)
+  for (r in seq_len(R)) {
+    sim <- simulate_data_2x2_one_group_predictor(N_per_state, K, A0, A1, Xbar,
+                                u_1, u_0, sigma_c_treat, sigma_c_ctrl,
+                                lambda, mu_delta, sigma_delta, sigma_y,
+                              seed = seed0 + r)
+    ## classical (ATT + per-county DiD)
+    county <- rep(seq_len(sim$stan_data$J), each = 2)
+    post   <- sim$stan_data$post
+    
+    # sim$stan_data$state_of_county is 1-based; convert to 0-based for R indexing
+    state  <- sim$stan_data$state_of_county - 1L
+    y      <- sim$stan_data$y
+    Nps    <- N_per_state
+    treated_ids <- which(sim$truth$is_treated == 1L)
+
+    
+    
+    # to use functions att_classical and per_county_did, we need to estimate sigma_y. Just to remark, att_classical and per_county_did assume homoskedasticity with estimated sigma_y. Without homoskedasticity assumption, there is no way to estimate the variance of treatment effect estimators for each county. The analytic formula is specific to this particular model.
+    
+    twfe_model <- lm(y ~ factor(county) + factor(post) + factor(state):factor(post))
+    
+    sigma_did_estimate <- summary(twfe_model)$sigma
+    
+    sigma_y_estimated <- sigma_did_estimate/2*sqrt(N_per_state)
+    
+    cls  <- att_classical(y, county, post, state, sigma_y_estimated, Nps)   
+    
+    # data.frame with {method, est, lo, hi}
+    dj   <- per_county_did(y, county, post, state, sigma_y_estimated, Nps, treated_ids)      # tibble {county, est, lo, hi}
+
+    ## Bayes (per-county posteriors + ATT from the same draws)
+    fitb <- fit_bayes_once(
+      stan_data       = sim$stan_data,
+      treated_idx     = sim$stan_data$treated_idx,
+      iter_warmup     = iter_warmup,
+      iter_sampling   = iter_sampling,
+      chains          = chains,
+      parallel_chains = chains,
+      seed            = seed0 + 10000 + r,
+      refresh         = 0
+    )
+
+    ## --- ATT metrics ---
+    true_delta <- sim$truth$delta
+    true_ATT <- mean(sim$truth$delta[treated_ids])
+    
+    att_all <- dplyr::bind_rows(
+      cls,
+      tibble::tibble(method = "Bayes DiD", est = fitb$ATT$mean, lo = fitb$ATT$lo, hi = fitb$ATT$hi)
+    ) |>
+      dplyr::mutate(true = true_ATT,
+                    bias = est - true,
+                    squared_error = (est - true)^2
+                    #overed = as.integer(true >= lo & true <= hi),
+                    #width = hi - lo)
+      )
+    ATT_rows[[r]] <- att_all
+
+    ## --- δ_j metrics (treated counties): DiD vs Bayes ---
+    
+    delta_bayes_did <- fitb$delta |>
+      dplyr::filter(j %in% treated_ids) |>
+      dplyr::rename(est_bayes_did = est, lo_bayes_did = lo, hi_bayes_did = hi)
+    
+    delta_did <- dj |>
+      dplyr::rename(j = county, est_did = est, lo_did = lo, hi_did = hi)
+    
+    # inner join by j
+    
+    d_join <- dplyr::inner_join(delta_bayes_did, delta_did, by = "j") |>
+      dplyr::mutate(
+        truth = sim$truth$delta[j],
+        
+        ## significance (two-sided 5%).
+        
+        sig_bayes_did = ( 0 > hi_bayes_did ) | (0 < lo_bayes_did),
+        sig_did = (0 > hi_did  ) | (0 < lo_did),
+        
+        ## Type-S indicators among the significant
+        
+        typeS_bayes_did = sig_bayes_did & (sign(est_bayes_did) != sign(truth)),
+        typeS_did = sig_did & (sign(est_did) != sign(truth)),
+        
+        ## squared errors
+        squared_error_bayes_did = (est_bayes_did - truth)^2,
+        squared_error_did = (est_did - truth)^2
+      )
+    n_sig_bayes_did <- sum(d_join$sig_bayes_did)
+    n_sig_did <- sum(d_join$sig_did)
+    typeS_cnt_b <- sum(d_join$typeS_bayes_did)
+    typeS_cnt_f <- sum(d_join$typeS_did)
+
+    DELTA_rows[[r]] <- tibble::tibble(
+      ## Counts
+      
+      n_sig_bayes_did = n_sig_bayes_did,
+      n_sig_did = n_sig_did,
+      ## Type-S counts and rates (NA if no significant)
+      typeS_bayes_did_count = typeS_cnt_b,
+      typeS_did_count = typeS_cnt_f,
+      typeS_bayes_did_rate  = ifelse(n_sig_bayes_did > 0, typeS_cnt_b / n_sig_bayes_did, NA_real_),
+      typeS_did_rate  = ifelse(n_sig_did > 0, typeS_cnt_f / n_sig_did, NA_real_),
+      ## MSE and RMSE
+      mse_b   = mean(d_join$squared_error_bayes_did),
+      mse_f   = mean(d_join$squared_error_did),
+      rmse_b  = sqrt(mean(d_join$squared_error_bayes_did)),
+      rmse_f  = sqrt(mean(d_join$squared_error_did)),
+      ## Coverage and average width (kept for completeness)
+      #cover_b = mean(d_join$truth >= db$lo_bayes_did & d_join$truth <= db$hi_bayes_did),
+      #cover_f = mean(d_join$truth >= df$lo_did & d_join$truth <= df$hi_did),
+      #width_b = mean(db$hi_bayes_did - db$lo_bayes_did),
+      #width_f = mean(df$hi_did - df$lo_did),
+      ## Spearman rank correlations
+      rank_b  = suppressWarnings(cor(d_join$est_bayes_did, d_join$truth, method = "spearman")),
+      rank_f  = suppressWarnings(cor(d_join$est_did, d_join$truth, method = "spearman"))
+    )
+  }
+
+  ATT_all   <- dplyr::bind_rows(ATT_rows)
+  DELTA_all <- dplyr::bind_rows(DELTA_rows)
+
+  att_sum <- ATT_all |>
+    dplyr::group_by(method) |>
+    dplyr::summarize(
+      rmse = sqrt(mean(squared_error)),
+      mse  = mean(squared_error),
+      bias = mean(bias),
+      #cover95 = mean(covered),
+      #avg_width = mean(width),
+      .groups = "drop"
+    )
+
+  delta_sum <- DELTA_all |>
+    dplyr::summarize(
+      ## Bayes
+      n_sig_bayes_did_mean = mean(n_sig_bayes_did),
+      typeS_bayes_did_count_mean = mean(typeS_bayes_did_count),
+      typeS_bayes_did_rate_mean  = mean(typeS_bayes_did_rate, na.rm = TRUE),
+      mse_b = mean(mse_b), rmse_b = mean(rmse_b),
+      #cover_b = mean(cover_b), width_b = mean(width_b),
+      rank_b  = mean(rank_b, na.rm = TRUE),
+      ## DiD
+      n_sig_did_mean = mean(n_sig_did),
+      typeS_did_count_mean = mean(typeS_did_count),
+      typeS_did_rate_mean  = mean(typeS_did_rate, na.rm = TRUE),
+      mse_f = mean(mse_f), rmse_f = mean(rmse_f),
+      #cover_f = mean(cover_f), width_f = mean(width_f),
+      rank_f  = mean(rank_f, na.rm = TRUE)
+    )
+
+  list(ATT = att_sum,
+       DELTA = delta_sum,
+       ATT_raw = ATT_all,
+       DELTA_raw = DELTA_all)
+}
+```
+
+
+
+```{r}
+res$DELTA_raw
+```
+
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(rlang)
+
+# ---------- Column harmonizer ----------
+harmonize_delta_cols <- function(df) {
+  first_hit <- function(df, candidates, new) {
+    hit <- intersect(candidates, names(df))
+    if (length(hit) && !(new %in% names(df))) df[[new]] <<- df[[hit[1]]]
+  }
+  # MSE / RMSE
+  first_hit(df, c("mse_b","mse_BDiD","mse_bayes_did","MSE_b","MSE_BDiD"), "mse_b")
+  first_hit(df, c("mse_f","mse_DiD","mse_freq","MSE_f","MSE_DiD"),       "mse_f")
+  first_hit(df, c("rmse_b","RMSE_b","rmse_BDiD"),                         "rmse_b")
+  first_hit(df, c("rmse_f","RMSE_f","rmse_DiD"),                          "rmse_f")
+  # Rank
+  first_hit(df, c("rank_b","spearman_b","rho_b"),                         "rank_b")
+  first_hit(df, c("rank_f","spearman_f","rho_f"),                         "rank_f")
+  # Sig counts
+  first_hit(df, c("n_sig_bayes_did_mean","n_sig_b_mean","n_sig_BDiD"),    "n_sig_bayes_did_mean")
+  first_hit(df, c("n_sig_did_mean","n_sig_f_mean","n_sig_DiD"),           "n_sig_did_mean")
+  # Type-S
+  first_hit(df, c("typeS_bayes_did_count_mean","typeS_b_count_mean"),     "typeS_bayes_did_count_mean")
+  first_hit(df, c("typeS_did_count_mean","typeS_f_count_mean"),           "typeS_did_count_mean")
+  first_hit(df, c("typeS_bayes_did_rate_mean","typeS_b_rate_mean"),       "typeS_bayes_did_rate_mean")
+  first_hit(df, c("typeS_did_rate_mean","typeS_f_rate_mean"),             "typeS_did_rate_mean")
+  df
+}
+
+# Helper: pick x var safely ("lambda" or "u_1")
+.pick_x <- function(df, x_axis) {
+  stopifnot(x_axis %in% c("lambda","u_1"))
+  if (!(x_axis %in% names(df))) {
+    abort(paste0("Column '", x_axis, "' not found in data."))
+  }
+  x_axis
+}
+
+# Helper: add facet if requested (facet_by is a STRING or NULL)
+.add_facet <- function(p, facet_by) {
+  if (!is.null(facet_by)) {
+    if (!facet_by %in% colnames(p$data)) {
+      abort(paste0("Facet column '", facet_by, "' not found in data."))
+    }
+    p + facet_wrap(vars(!!sym(facet_by)), scales = "free_y")
+  } else p
+}
+
+# ---------- 1) MSE ----------
+plot_delta_mean_squared_error <- function(grid_out, x_axis = "lambda", facet_by = NULL){
+  df <- harmonize_delta_cols(grid_out)
+  x_axis <- .pick_x(df, x_axis)
+  need <- c("mse_b","mse_f", x_axis)
+  if (!all(need %in% names(df))) abort("Missing columns: ", paste(setdiff(need, names(df)), collapse=", "))
+  plot_df <- df |>
+    select(all_of(c(x_axis, facet_by)), mse_b, mse_f) |>
+    pivot_longer(cols = c(mse_b, mse_f), names_to = "method", values_to = "value") |>
+    mutate(method = ifelse(method == "mse_b", "Bayes", "DiD"))
+  p <- ggplot(plot_df, aes(x = .data[[x_axis]], y = value, linetype = method, shape = method)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 1.8) +
+    scale_linetype_manual(values = c(Bayes = "dashed", DiD = "solid")) +
+    scale_shape_manual(values = c(Bayes = 17, DiD = 16)) +
+    labs(x = if (x_axis == "lambda") expression(lambda) else expression(u[1]),
+         y = "MSE", linetype = "Method", shape = "Method") +
+    theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+  .add_facet(p, facet_by)
+}
+
+# ---------- 2) Rank correlation ----------
+plot_delta_rank_correlation <- function(grid_out, x_axis = "lambda", facet_by = NULL) {
+  df <- harmonize_delta_cols(grid_out)
+  x_axis <- .pick_x(df, x_axis)
+  need <- c("rank_b","rank_f", x_axis)
+  if (!all(need %in% names(df))) abort("Missing columns: ", paste(setdiff(need, names(df)), collapse=", "))
+  plot_df <- df |>
+    select(all_of(c(x_axis, facet_by)), rank_b, rank_f) |>
+    pivot_longer(cols = c(rank_b, rank_f), names_to = "method", values_to = "value") |>
+    mutate(method = ifelse(method == "rank_b", "Bayes", "DiD"))
+  p <- ggplot(plot_df, aes(x = .data[[x_axis]], y = value, linetype = method, shape = method)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 1.8) +
+    scale_linetype_manual(values = c(Bayes = "dashed", DiD = "solid")) +
+    scale_shape_manual(values = c(Bayes = 17, DiD = 16)) +
+    labs(x = if (x_axis == "lambda") expression(lambda) else expression(u[1]),
+         y = "Spearman ρ", linetype = "Method", shape = "Method") +
+    theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+  .add_facet(p, facet_by)
+}
+
+# ---------- 3) Number significant ----------
+plot_delta_significant_counts <- function(grid_out, x_axis = "lambda", facet_by = NULL) {
+  df <- harmonize_delta_cols(grid_out)
+  x_axis <- .pick_x(df, x_axis)
+  need <- c("n_sig_bayes_did_mean","n_sig_did_mean", x_axis)
+  if (!all(need %in% names(df))) abort("Missing columns: ", paste(setdiff(need, names(df)), collapse=", "))
+  plot_df <- df |>
+    select(all_of(c(x_axis, facet_by)), n_sig_bayes_did_mean, n_sig_did_mean) |>
+    pivot_longer(cols = c(n_sig_bayes_did_mean, n_sig_did_mean),
+                 names_to = "method", values_to = "value") |>
+    mutate(method = ifelse(method == "n_sig_bayes_did_mean", "Bayes", "DiD"))
+  p <- ggplot(plot_df, aes(x = .data[[x_axis]], y = value, linetype = method, shape = method)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 1.8) +
+    scale_linetype_manual(values = c(Bayes = "dashed", DiD = "solid")) +
+    scale_shape_manual(values = c(Bayes = 17, DiD = 16)) +
+    labs(x = if (x_axis == "lambda") expression(lambda) else expression(u[1]),
+         y = "Number significant (5%)", linetype = "Method", shape = "Method") +
+    theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+  .add_facet(p, facet_by)
+}
+
+# ---------- 4) Type-S (count or rate) ----------
+plot_delta_type_S_errors <- function(grid_out, x_axis = "lambda", facet_by = NULL,
+                                     use_typeS = c("count","rate")) {
+  use_typeS <- match.arg(use_typeS)
+  df <- harmonize_delta_cols(grid_out)
+  x_axis <- .pick_x(df, x_axis)
+
+  if (use_typeS == "count") {
+    need <- c("typeS_bayes_did_count_mean","typeS_did_count_mean", x_axis)
+    if (!all(need %in% names(df))) abort("Missing columns: ", paste(setdiff(need, names(df)), collapse=", "))
+    plot_df <- df |>
+      select(all_of(c(x_axis, facet_by)), typeS_bayes_did_count_mean, typeS_did_count_mean) |>
+      pivot_longer(cols = c(typeS_bayes_did_count_mean, typeS_did_count_mean),
+                   names_to = "method", values_to = "value") |>
+      mutate(method = ifelse(method == "typeS_bayes_did_count_mean", "Bayes", "DiD"))
+    ylab <- "Mean Type-S (count)"
+  } else {
+    need <- c("typeS_bayes_did_rate_mean","typeS_did_rate_mean", x_axis)
+    if (!all(need %in% names(df))) abort("Missing columns: ", paste(setdiff(need, names(df)), collapse=", "))
+    plot_df <- df |>
+      select(all_of(c(x_axis, facet_by)), typeS_bayes_did_rate_mean, typeS_did_rate_mean) |>
+      pivot_longer(cols = c(typeS_bayes_did_rate_mean, typeS_did_rate_mean),
+                   names_to = "method", values_to = "value") |>
+      mutate(method = ifelse(method == "typeS_bayes_did_rate_mean", "Bayes", "DiD"))
+    ylab <- "Type-S rate"
+  }
+
+  p <- ggplot(plot_df, aes(x = .data[[x_axis]], y = value, linetype = method, shape = method)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 1.8) +
+    scale_linetype_manual(values = c(Bayes = "dashed", DiD = "solid")) +
+    scale_shape_manual(values = c(Bayes = 17, DiD = 16)) +
+    labs(x = if (x_axis == "lambda") expression(lambda) else expression(u[1]),
+         y = ylab, linetype = "Method", shape = "Method") +
+    theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+  .add_facet(p, facet_by)
+}
+```
+
+
+
+
+
+
+```{r}
+# draw plots
+
+p1 <- plot_delta_mean_squared_error(grid_out)
+
+p2 <- plot_delta_rank_correlation(grid_out)
+
+p3 <- plot_delta_significant_counts(grid_out)
+
+p4 <- plot_delta_type_S_errors(grid_out, use_typeS = "rate")
+
+library(patchwork)
+(p1 | p2) / (p3 | p4) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+
+```
+
+
+
+
+```{r}
+library(purrr); library(dplyr); library(tidyr)
+
+run_grid <- function(lambdas, u1_grid, R = 50, N_per_state = 40, ...) {
+  map2_dfr(lambdas, u1_grid, \(lam, u1) {
+    res <- quick_compare(R = R, N_per_state = N_per_state, lambda = lam, u_1 = u1,  ...)
+    # Flatten: keep only delta summaries for plotting the 4 quantities
+    tibble(lambda = lam, u_1 = u1) |>
+      bind_cols(res$DELTA)
+  })
+}
+
+```
+
+
+
+
+```{r}
+# Example:
+# record the run time
+# run R = 1, lambdas < -seq(0,1,by=1), two lambdas, iter_warmup 300, iter_sampling = 600, chains = 1
+# takes 16 secs
+
+
+# run R = 1, lambdas < -seq(0, 9, by=1), 10 lambdas, iter_warmup 300, iter_sampling = 600, chains = 1
+# takes 83.9 secs
+
+
+# run R = 50, lambdas < -seq(0, 9, by=1), 10 lambdas, iter_warmup 300, iter_sampling = 600, chains = 1
+# takes 83.9 secs*50 secs = 4195 secs = 70 mins
+# diagnostics. One reports ER < 0.3. We need to run more iterations int the warmup.
+
+
+# run R = 20, lambdas <- seq(0, 20, by = 3), 7 lambdas, iter_warmup 500, iter_sampling = 600, chains=1
+# 25 mins
+# run R = 10, lambdas <- seq(0, 21, by = 7), 4 lambdas, iter_warmup 500, iter_sampling = 600, chains=2
+# 10 mins
+
+start_time <- Sys.time()
+lambdas <- seq(0, 21, by = 7)
+u1_grid <-  rep(1, length(lambdas))  
+grid_out_lambda_varying <- run_grid(lambdas, u1_grid, R = 10, iter_warmup = 500, iter_sampling = 600, chains = 2)
+
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+
+
+```{r}
+# print some results of grid_out
+
+print(grid_out_lambda_varying)
+
+# save grid_out_lambda_varying to local file
+
+saveRDS(grid_out_lambda_varying, file = "data/grid_out_lambda_varying.rds")
+
+p1_lambda_varying <- plot_delta_mean_squared_error(grid_out_lambda_varying)
+
+p2_lambda_varying <- plot_delta_rank_correlation(grid_out_lambda_varying)
+
+p3_lambda_varying <- plot_delta_significant_counts(grid_out_lambda_varying)
+
+p4_lambda_varying <- plot_delta_type_S_errors(grid_out_lambda_varying, use_typeS = "rate")
+
+(p1_lambda_varying | p2_lambda_varying) / (p3_lambda_varying | p4_lambda_varying) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+# save the plots to local file
+
+ggsave("images/grid_out_lambda_varying_plots.png", width = 10, height = 8)
+
+```
+
+
+
+```{r}
+
+# Example: hold lambda and u0 fixed and vary the difference between u1 and u0. Just vary u1. Set u0 = 0.
+
+u1_grid  <- seq(1, 25, by = 7)  
+lambdas <- rep(2, length(u1_grid))
+grid_out_u1_varying <- run_grid(lambdas, u1_grid, R = 10, iter_warmup = 500, iter_sampling = 600, chains = 2)
+```
+
+
+```{r}
+# print some results of grid_out
+print(grid_out_u1_varying)
+
+saveRDS(grid_out_u1_varying, file = "data/grid_out_u1_varying.rds")
+
+# plots for delta_j estimates
+
+p1_u1_varying <- plot_delta_mean_squared_error(grid_out_u1_varying, x_axis = "u_1")
+
+p2_u1_varying <- plot_delta_rank_correlation(grid_out_u1_varying, x_axis = "u_1")
+
+p3_u1_varying <- plot_delta_significant_counts(grid_out_u1_varying, x_axis = "u_1")
+
+p4_u1_varying <- plot_delta_type_S_errors(grid_out_u1_varying, x_axis = "u_1", use_typeS = "rate")
+
+(p1_u1_varying | p2_u1_varying) / (p3_u1_varying | p4_u1_varying) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+ggsave("images/grid_out_u1_varying_plots.png", width = 10, height = 8)
+
+```
+
+
+```{r more grids few replicates simulations}
+start_time <- Sys.time()
+lambdas_large <- seq(-100, 100, by = 10)
+u1_grid_large <-  rep(1, length(lambdas_large))  
+grid_out_lambda_varying_large <- run_grid(lambdas_large, u1_grid_large, R = 10, iter_warmup = 800, iter_sampling = 600, chains = 2)
+end_time <- Sys.time()
+end_time - start_time
+```
+
+### decrease the sigma_y to make it more favorable to DiD and see how our approach performs
+
+
+```{r}
+
+start_time <- Sys.time()
+lambdas_large <- seq(-100, 100, by = 25)
+u1_grid_large <-  rep(1, length(lambdas_large))  
+grid_out_lambda_varying_large_small_sigma_y <- run_grid(lambdas_large, u1_grid_large, sigma_y = 0.2, R = 10, iter_warmup = 800, iter_sampling = 600, chains = 2)
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+
+```{r}
+saveRDS(grid_out_lambda_varying_large_small_sigma_y, file = "data/grid_out_lambda_varying_large_small_sigma_y.rds")
+
+p1_lambda_varying_large_small_sigma_y <- plot_delta_mean_squared_error(grid_out_lambda_varying_large_small_sigma_y, x_axis = "lambda")
+
+p2_lambda_varying_large_small_sigma_y <- plot_delta_rank_correlation(grid_out_lambda_varying_large_small_sigma_y, x_axis = "lambda")
+
+p3_lambda_varying_large_small_sigma_y <- plot_delta_significant_counts(grid_out_lambda_varying_large_small_sigma_y, x_axis = "lambda")
+
+p4_lambda_varying_large_small_sigma_y <- plot_delta_type_S_errors(grid_out_lambda_varying_large_small_sigma_y,x_axis = "lambda" , use_typeS = "rate")
+
+(p1_lambda_varying_large_small_sigma_y | p2_lambda_varying_large_small_sigma_y) / (p3_lambda_varying_large_small_sigma_y | p4_lambda_varying_large_small_sigma_y) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+ggsave("images/grid_out_lambda_varying_large_plots_small_sigma_y.png", width = 10, height = 8)
+
+```
+
+```{r}
+
+u1_grid  <- seq(-100, 100, by = 10)  
+lambdas <- rep(2, length(u1_grid))
+grid_out_u1_varying_large_small_sigma_y <- run_grid(lambdas, u1_grid,sigma_y = 0.2, R = 30, iter_warmup = 800, iter_sampling = 600, chains = 2)
+
+# print some results of grid_out_u1_varying_large
+print(grid_out_u1_varying_large_small_sigma_y)
+
+saveRDS(grid_out_u1_varying_large_small_sigma_y, file = "data/grid_out_u1_varying_large_small_sigma_y.rds")
+
+p1_u1_varying_large_small_sigma_y <- plot_delta_mean_squared_error(grid_out_u1_varying_large_small_sigma_y, x_axis = "u_1")
+
+p2_u1_varying_large_small_sigma_y <- plot_delta_rank_correlation(grid_out_u1_varying_large_small_sigma_y, x_axis = "u_1")
+
+p3_u1_varying_large_small_sigma_y <- plot_delta_significant_counts(grid_out_u1_varying_large_small_sigma_y, x_axis = "u_1")
+
+p4_u1_varying_large_small_sigma_y <- plot_delta_type_S_errors(grid_out_u1_varying_large_small_sigma_y, use_typeS = "rate", x_axis = "u_1")
+
+(p1_u1_varying_large_small_sigma_y | p2_u1_varying_large_small_sigma_y) / (p3_u1_varying_large_small_sigma_y | p4_u1_varying_large_small_sigma_y) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+ggsave("images/grid_out_u1_varying_large_plots_small_sigma_y.png", width = 10, height = 8)
+
+```
+
+
+
+
+
+
+
+
+
+### Run the u for the same range -100 to 100
+
+### Try to decrease the sigma_y to make it more favorable to DiD and see how our approach performs
+
+
+
+
+```{r}
+print(grid_out_lambda_varying_large)
+
+saveRDS(grid_out_lambda_varying_large, file = "data/grid_out_lambda_varying_large_wider_range.rds")
+
+p1_lambda_varying_large <- plot_delta_mean_squared_error(grid_out_lambda_varying_large, x_axis = "lambda")
+
+p2_lambda_varying_large <- plot_delta_rank_correlation(grid_out_lambda_varying_large, x_axis = "lambda")
+
+p3_lambda_varying_large <- plot_delta_significant_counts(grid_out_lambda_varying_large, x_axis = "lambda")
+
+p4_lambda_varying_large <- plot_delta_type_S_errors(grid_out_lambda_varying_large,x_axis = "lambda" , use_typeS = "rate")
+```
+
+
+```{r}
+library(patchwork)
+(p1_lambda_varying_large | p2_lambda_varying_large) / (p3_lambda_varying_large | p4_lambda_varying_large) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+ggsave("images/grid_out_lambda_varying_large_plots_wider_range.png", width = 10, height = 8)
+```
+
+
+```{r}
+
+mu_delta<-3
+sigma_delta<-1.6
+
+delta <- rnorm(40, mu_delta, sigma_delta)
+
+# count the statistical significant delta estimates suppose sigma_delta is known
+
+sum((delta - 0)/sigma_delta > 1.96 | (delta - 0)/sigma_delta < -1.96)
+
+# replicate many times
+
+set.seed(1234)
+R <- 1000
+sig_counts <- replicate(R, {
+  delta <- rnorm(40, mu_delta, sigma_delta)
+  sum((delta - 0)/sigma_delta > 1.96 | (delta - 0)/sigma_delta < -1.96)
+})
+
+# mark the mean significant counts
+
+mean(sig_counts)
+hist(sig_counts, breaks = seq(-0.5, 40.5, by = 1), main = "Histogram of Significant Counts", xlab = "Number of Significant Counts")
+abline(v = mean(sig_counts), col = "red", lwd = 2)
+#show the mean at x-axis
+
+# move the text a bit to the top left
+
+text(x = mean(sig_counts) -8, y = 120, labels = paste("Mean =", round(mean(sig_counts),2)), col = "red")
+
+# show median
+
+median_sig <- median(sig_counts)
+abline(v = median_sig, col = "blue", lwd = 2)
+text(x = median_sig + 7, y = 120, labels = paste("Median =", round(median_sig,2)), col = "blue")
+
+
+
+saveRDS(sig_counts, file = "data/sig_counts_simulation.rds")
+
+```
+
+
+```{r}
+
+# Open a PNG device
+png("images/sig_counts_histogram.png", width = 800, height = 600)
+
+hist(sig_counts, 
+     breaks = seq(-0.5, 40.5, by = 1), 
+     main = "Histogram of Significant Counts", 
+     xlab = "Number of Significant Counts")
+
+# Add mean line and label
+abline(v = mean(sig_counts), col = "red", lwd = 2)
+text(x = mean(sig_counts) - 8, y = 120, 
+     labels = paste("Mean =", round(mean(sig_counts), 2)), 
+     col = "red")
+
+# Add median line and label
+abline(v = median_sig, col = "blue", lwd = 2)
+text(x = median_sig + 7, y = 120, 
+     labels = paste("Median =", round(median_sig, 2)), 
+     col = "blue")
+
+# Close the PNG device
+dev.off()
+
+# Save as PDF as well
+pdf("images/sig_counts_histogram.pdf", width = 8, height = 6)
+
+hist(sig_counts, 
+     breaks = seq(-0.5, 40.5, by = 1), 
+     main = "Histogram of Significant Counts", 
+     xlab = "Number of Significant Counts")
+
+abline(v = mean(sig_counts), col = "red", lwd = 2)
+text(x = mean(sig_counts) - 8, y = 120, 
+     labels = paste("Mean =", round(mean(sig_counts), 2)), 
+     col = "red")
+
+abline(v = median_sig, col = "blue", lwd = 2)
+text(x = median_sig + 7, y = 120, 
+     labels = paste("Median =", round(median_sig, 2)), 
+     col = "blue")
+
+dev.off()
+
+
+```
+
+
+
+
+```{r}
+u1_grid  <- seq(-100, 100, by = 10)  
+lambdas <- rep(2, length(u1_grid))
+grid_out_u1_varying_large <- run_grid(lambdas, u1_grid, R = 10, iter_warmup = 800, iter_sampling = 600, chains = 2)
+```
+
+```{r}
+# print some results of grid_out_u1_varying_large
+print(grid_out_u1_varying_large)
+
+saveRDS(grid_out_u1_varying_large, file = "data/grid_out_u1_varying_large.rds")
+
+p1_u1_varying_large <- plot_delta_mean_squared_error(grid_out_u1_varying_large, x_axis = "u_1")
+
+p2_u1_varying_large <- plot_delta_rank_correlation(grid_out_u1_varying_large, x_axis = "u_1")
+
+p3_u1_varying_large <- plot_delta_significant_counts(grid_out_u1_varying_large, x_axis = "u_1")
+
+p4_u1_varying_large <- plot_delta_type_S_errors(grid_out_u1_varying_large, use_typeS = "rate", x_axis = "u_1")
+
+(p1_u1_varying_large | p2_u1_varying_large) / (p3_u1_varying_large | p4_u1_varying_large) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+ggsave("images/grid_out_u1_varying_large_plots.png", width = 10, height = 8)
+```
+
+
+
+
+```{r more grids few replicates simulations}
+
+start_time <- Sys.time()
+lambdas_large <- seq(0, 21, by = 3)
+u1_grid_large <-  rep(1, length(lambdas))  
+grid_out_lambda_varying_large <- run_grid(lambdas, u1_grid, R = 50, iter_warmup = 1000, iter_sampling = 600, chains = 2)
+
+end_time <- Sys.time()
+end_time - start_time
+
+
+print(grid_out_lambda_varying)
+
+p1_lambda_varying_large <- plot_delta_mean_squared_error(grid_out_lambda_varying_large)
+
+p2_lambda_varying_large <- plot_delta_rank_correlation(grid_out_lambda_varying_large)
+
+p3_lambda_varying_large <- plot_delta_significant_counts(grid_out_lambda_varying_large)
+
+p4_lambda_varying_large <- plot_delta_type_S_errors(grid_out_lambda_varying_large, use_typeS = "rate")
+
+(p1_lambda_varying_large | p2_lambda_varying_large) / (p3_lambda_varying_large | p4_lambda_varying_large) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+
+u1_grid  <- seq(1, 25, by = 3)  
+lambdas <- rep(2, length(u1_grid))
+grid_out_u1_varying_large <- run_grid(lambdas, u1_grid, R = 50, iter_warmup = 1000, iter_sampling = 600, chains = 2)
+
+# print some results of grid_out
+print(grid_out_u1_varying_large)
+
+p1_u1_varying_large <- plot_delta_mean_squared_error(grid_out_u1_varying_large)
+
+p2_u1_varying_large <- plot_delta_rank_correlation(grid_out_u1_varying_large)
+
+p3_u1_varying_large <- plot_delta_significant_counts(grid_out_u1_varying_large)
+
+p4_u1_varying_large <- plot_delta_type_S_errors(grid_out_u1_varying_large, use_typeS = "rate")
+
+(p1_u1_varying_large | p2_u1_varying_large) / (p3_u1_varying_large | p4_u1_varying_large) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+```
+
+
+
+
+
+
+
+```{r correlation between individual treatment effects and county random effects exists}
+
+# function to generate correlated data
+
+# 2×2: one treated state (s=1), one control (s=0)
+simulate_data_2x2_one_group_predictor_correlated <- function(
+  rho = 0.5, N_per_state = 40, K = 1,
+  A0 = 0.0, A1 = 0.4,
+  Xbar = matrix(c(-0.5, 0.8), nrow = 2, byrow = TRUE),
+  u_1 = 1, u_0 = 0,
+  sigma_c_treat = 1.0, sigma_c_ctrl = 0.6,
+  lambda = 0.5, mu_delta = 3.0, sigma_delta = 1.6,
+  sigma_y = 1.0, seed = 1L
+){
+  set.seed(seed)
+
+  # Basic layout: S=2 states (1 treated, 2 control)
+  S  <- 2L
+  J_t <- N_per_state
+  J_c <- N_per_state
+  J   <- J_t + J_c
+
+  is_treated       <- c(rep(1L, J_t), rep(0L, J_c))
+  state_of_county  <- c(rep(1L, J_t), rep(2L, J_c))
+  state_is_treated <- c(1L, 0L)
+
+  # State-level effects u_s
+  u <- c(u_1, u_0)  # NOTE: by your earlier code u <- c(u_0, u_1); choose your convention.
+                    # Here I keep s=1 as treated (u_1), s=2 as control (u_0).
+                    # If you prefer the other order, swap to c(u_0, u_1).
+
+  # Allocate
+  c     <- numeric(J)
+  delta <- numeric(J)
+
+  # ---- Joint draws for treated counties: (c_j, delta_j) ~ N( (0, mu_delta), Sigma ) ----
+  # Sigma = [ sigma_c_treat^2, rho*sigma_c_treat*sigma_delta; rho*sigma_c_treat*sigma_delta, sigma_delta^2 ]
+  if (!is.finite(rho) || abs(rho) >= 1) stop("rho must be finite with |rho| < 1.")
+  if (sigma_c_treat <= 0 || sigma_delta <= 0) stop("sigma_c_treat and sigma_delta must be > 0.")
+  if (sigma_c_ctrl  <= 0) stop("sigma_c_ctrl must be > 0.")
+
+  Sigma_t <- matrix(c(
+    sigma_c_treat^2,            rho * sigma_c_treat * sigma_delta,
+    rho * sigma_c_treat * sigma_delta, sigma_delta^2
+  ), nrow = 2, byrow = TRUE)
+
+  # Numerical guard: if Sigma is nearly singular due to rho ~ +/-1, nudge
+  eigvals <- eigen(Sigma_t, symmetric = TRUE, only.values = TRUE)$values
+  if (min(eigvals) <= 0) {
+    eps <- 1e-8
+    # shrink off-diagonal slightly towards boundary to ensure PD
+    off <- sign(rho) * min(abs(rho * sigma_c_treat * sigma_delta), sigma_c_treat * sigma_delta - eps)
+    Sigma_t[1, 2] <- Sigma_t[2, 1] <- off
+  }
+
+  # Cholesky (upper) and simulate
+  R <- chol(Sigma_t) # Upper triangular such that t(R) %*% R = Sigma
+  Z <- matrix(rnorm(J_t * 2), ncol = 2)  # iid N(0,1)
+  draws_treated <- Z %*% t(R)            # each row ~ N(0, Sigma)
+  draws_treated[, 2] <- draws_treated[, 2] + mu_delta  # shift delta mean
+
+  # Assign to treated block
+  idx_t <- which(is_treated == 1L)
+  c[idx_t]     <- draws_treated[, 1]
+  delta[idx_t] <- draws_treated[, 2]
+
+  # ---- Controls: c_j ~ N(0, sigma_c_ctrl^2), delta_j = 0 ----
+  idx_c <- which(is_treated == 0L)
+  c[idx_c]     <- rnorm(J_c, 0, sigma_c_ctrl)
+  delta[idx_c] <- 0
+
+  # ---- Build panel (two periods) ----
+  county <- rep(seq_len(J), each = 2)
+  post   <- rep(c(0L, 1L), times = J)
+  D      <- is_treated[county] * post
+  s_row  <- state_of_county[county]
+
+  # Handle A1 as scalar or length-K vector
+  A1_vec <- if (length(A1) == 1L) rep(A1, K) else as.numeric(A1)
+
+  # Linear predictor from group-level predictors
+  lin_x <- rowSums(
+    Xbar[s_row, , drop = FALSE] *
+      matrix(A1_vec, nrow = length(s_row), ncol = K, byrow = TRUE)
+  )
+
+  # Outcome
+  mu <- A0 + lin_x + u[s_row] + c[county] + lambda * post + delta[county] * D
+  y  <- rnorm(length(mu), mu, sigma_y)
+
+  list(
+    stan_data = list(
+      N = length(y), J = J, S = 2L, K = K, y = y,
+      county = as.integer(county), post = as.integer(post), D = as.integer(D),
+      state_of_county = as.integer(state_of_county),
+      Xbar = Xbar,
+      is_treated = as.integer(is_treated),
+      state_is_treated = as.integer(state_is_treated),
+      J_treated = J_t,
+      treated_idx = as.integer(idx_t),
+      center_c = 0L,
+      pool_u_within_group = 0L,
+      big_sd_u = 10
+    ),
+    truth = list(
+      A0 = A0, A1 = A1_vec, Xbar = Xbar, lambda = lambda, sigma_y = sigma_y,
+      u = u, c = c, is_treated = is_treated, delta = delta,
+      mu_delta = mu_delta, sigma_delta = sigma_delta, rho = rho,
+      sigma_c_treat = sigma_c_treat, sigma_c_ctrl = sigma_c_ctrl
+    )
+  )
+}
+```
+
+
+
+
+```{r quick compare with dependence}
+quick_compare_with_correlation <- function(
+  rho = 0.5, R = 50, N_per_state = 40, K = 1,
+  A0 = 0.0, A1 = 0.4,
+  Xbar = matrix(c(-0.5, 0.8), nrow = 2, byrow = TRUE),
+  u_1 = 1, u_0 = 0,
+  sigma_c_treat = 1.0, sigma_c_ctrl = 0.7,
+  lambda = 2, mu_delta = 1.0, sigma_delta = 0.6,
+  sigma_y = 1.0, seed0 = 1234,
+  iter_warmup = 500, iter_sampling = 500, chains = 2
+){
+  ATT_rows   <- vector("list", R)
+  DELTA_rows <- vector("list", R)
+
+  for (r in seq_len(R)) {
+    sim <- simulate_data_2x2_one_group_predictor_correlated(
+      rho = rho, N_per_state = N_per_state, K = K,
+      A0 = A0, A1 = A1, Xbar = Xbar,
+      u_1 = u_1, u_0 = u_0,
+      sigma_c_treat = sigma_c_treat, sigma_c_ctrl = sigma_c_ctrl,
+      lambda = lambda, mu_delta = mu_delta, sigma_delta = sigma_delta,
+      sigma_y = sigma_y, seed = seed0 + r
+    )
+
+    # unpack
+    y      <- sim$stan_data$y               # length 2J
+    county <- sim$stan_data$county          # length 2J
+    post   <- sim$stan_data$post            # length 2J
+    soc    <- sim$stan_data$state_of_county # length J (per county)
+    S      <- sim$stan_data$S
+    Nps    <- N_per_state
+    treated_ids <- which(sim$truth$is_treated == 1L)
+
+    # per-row state (1=treated state, 0=control) for helpers
+    state_row <- soc[county]                  # length 2J, in {1,2}
+    state01   <- as.integer(state_row == 1L)  # length 2J, in {0,1}
+
+    # TWFE regression on aligned data (optional; not used for sigma_y here)
+    df_reg <- data.frame(
+      y = y,
+      county = factor(county),
+      post   = factor(post),
+      state  = factor(state_row)
+    )
+    twfe_model <- lm(y ~ county + post + state:post, data = df_reg)
+
+    # Use known simulation SD (homoskedastic)
+    sigy <- sim$truth$sigma_y
+
+    # --- Classical ATT (your signature) ---
+    cls <- att_classical(
+      y      = y,
+      county = county,
+      post   = post,
+      state  = state01,      # IMPORTANT: per-row 0/1 indicator
+      sigma_y = sigy,
+      N_per_state = Nps
+    )
+    # cls is tibble {method, est, lo, hi}
+
+    # --- Per-county DiD (your signature) ---
+    dj <- per_county_did(
+      y = y,
+      county = county,
+      post = post,
+      state = state01,       # same 0/1 per-row state
+      sigma_y = sigy,
+      N_per_state = Nps,
+      treated_ids = treated_ids
+    )
+
+    # --- Bayesian fit ---
+    fitb <- fit_bayes_once(
+      stan_data       = sim$stan_data,
+      treated_idx     = sim$stan_data$treated_idx,
+      iter_warmup     = iter_warmup,
+      iter_sampling   = iter_sampling,
+      chains          = chains,
+      parallel_chains = chains,
+      seed            = seed0 + 10000 + r,
+      refresh         = 0
+    )
+
+    # ATT metrics
+    true_ATT <- mean(sim$truth$delta[treated_ids])
+    att_all <- dplyr::bind_rows(
+      cls,
+      tibble::tibble(method = "Bayes DiD", est = fitb$ATT$mean, lo = fitb$ATT$lo, hi = fitb$ATT$hi)
+    ) |>
+      dplyr::mutate(true = true_ATT,
+                    bias = est - true,
+                    squared_error = (est - true)^2)
+
+    ATT_rows[[r]] <- att_all
+
+    # δ_j: Bayes vs per-county DiD
+    delta_bayes <- fitb$delta |>
+      dplyr::filter(j %in% treated_ids) |>
+      dplyr::rename(est_bayes = est, lo_bayes = lo, hi_bayes = hi)
+
+    delta_did <- dj |>
+      dplyr::rename(j = county, est_did = est, lo_did = lo, hi_did = hi)
+
+    d_join <- dplyr::inner_join(delta_bayes, delta_did, by = "j") |>
+      dplyr::mutate(
+        truth = sim$truth$delta[j],
+        sig_bayes = (0 > hi_bayes) | (0 < lo_bayes),
+        sig_did   = (0 > hi_did)   | (0 < lo_did),
+        typeS_bayes = sig_bayes & (sign(est_bayes) != sign(truth)),
+        typeS_did   = sig_did   & (sign(est_did)   != sign(truth)),
+        sq_bayes = (est_bayes - truth)^2,
+        sq_did   = (est_did   - truth)^2
+      )
+
+    DELTA_rows[[r]] <- tibble::tibble(
+      n_sig_bayes = sum(d_join$sig_bayes),
+      n_sig_did   = sum(d_join$sig_did),
+      typeS_bayes_count = sum(d_join$typeS_bayes),
+      typeS_did_count   = sum(d_join$typeS_did),
+      typeS_bayes_rate  = ifelse(sum(d_join$sig_bayes) > 0,
+                                 sum(d_join$typeS_bayes) / sum(d_join$sig_bayes), NA_real_),
+      typeS_did_rate    = ifelse(sum(d_join$sig_did) > 0,
+                                 sum(d_join$typeS_did) / sum(d_join$sig_did), NA_real_),
+      mse_bayes  = mean(d_join$sq_bayes),
+      mse_did    = mean(d_join$sq_did),
+      rmse_bayes = sqrt(mean(d_join$sq_bayes)),
+      rmse_did   = sqrt(mean(d_join$sq_did)),
+      rank_bayes = suppressWarnings(cor(d_join$est_bayes, d_join$truth, method = "spearman")),
+      rank_did   = suppressWarnings(cor(d_join$est_did,   d_join$truth, method = "spearman"))
+    )
+  }
+
+  ATT_all   <- dplyr::bind_rows(ATT_rows)
+  DELTA_all <- dplyr::bind_rows(DELTA_rows)
+
+  att_sum <- ATT_all |>
+    dplyr::group_by(method) |>
+    dplyr::summarize(
+      rmse = sqrt(mean(squared_error)),
+      mse  = mean(squared_error),
+      bias = mean(bias),
+      .groups = "drop"
+    )
+
+  delta_sum <- DELTA_all |>
+    dplyr::summarize(
+      n_sig_bayes_mean = mean(n_sig_bayes),
+      typeS_bayes_count_mean = mean(typeS_bayes_count),
+      typeS_bayes_rate_mean  = mean(typeS_bayes_rate, na.rm = TRUE),
+      mse_bayes = mean(mse_bayes), rmse_bayes = mean(rmse_bayes),
+      rank_bayes = mean(rank_bayes, na.rm = TRUE),
+      n_sig_did_mean = mean(n_sig_did),
+      typeS_did_count_mean = mean(typeS_did_count),
+      typeS_did_rate_mean  = mean(typeS_did_rate, na.rm = TRUE),
+      mse_did = mean(mse_did), rmse_did = mean(rmse_did),
+      rank_did = mean(rank_did, na.rm = TRUE)
+    )
+
+  list(ATT = att_sum,
+       DELTA = delta_sum,
+       ATT_raw = ATT_all,
+       DELTA_raw = DELTA_all)
+}
+
+
+
+```
+
+
+
+
+```{r run grid with correlation}
+
+library(purrr); library(dplyr); library(tidyr);
+run_grid_with_correlation <- function(rho, lambdas, u1_grid, R = 50, N_per_state = 40, ...) {
+  purrr::map2_dfr(lambdas, u1_grid, function(lam, u1) {
+    res <- quick_compare_with_correlation(
+      rho = rho, R = R, N_per_state = N_per_state,
+      lambda = lam, u_1 = u1, ...
+    )
+    tibble::tibble(lambda = lam, u_1 = u1) |>
+      dplyr::bind_cols(res$DELTA)
+  })
+}
+```
+
+
+
+```{r run experiments}
+# generate data with rho to be 0.5
+
+
+# fit model 1 as we did before. Independent priors. Do not model the correlation between the individual treatment effects and random effects.
+
+rho <- 0.5
+start_time <- Sys.time()
+lambdas_large <- seq(-30, 30, by = 10)
+u1_grid_large <- rep(1, length(lambdas_large))
+grid_out <- run_grid_with_correlation(
+  rho = rho,
+  lambdas = lambdas_large,
+  u1_grid = u1_grid_large,
+  R = 5,
+  iter_warmup = 800, iter_sampling = 600, chains = 2
+)
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+```{r plot the results with rho to be 0.5}
+
+saveRDS(grid_out, file = "data/grid_out_lambda_varying_with_correlation.rds")
+
+p1_lambda_varying_with_correlation <- plot_delta_mean_squared_error(grid_out, x_axis = "lambda")
+
+p2_lambda_varying_with_correlation <- plot_delta_rank_correlation(grid_out, x_axis = "lambda")
+
+p3_lambda_varying_with_correlation <- plot_delta_significant_counts(grid_out, x_axis = "lambda")
+
+p4_lambda_varying_with_correlation <- plot_delta_type_S_errors(grid_out, x_axis = "lambda" , use_typeS = "rate")
+
+(p1_lambda_varying_with_correlation | p2_lambda_varying_with_correlation) / (p3_lambda_varying_with_correlation | p4_lambda_varying_with_correlation) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+ggsave("images/grid_out_lambda_varying_with_correlation.png", width = 10, height = 8)
+
+```
+
+
+```{r run a large-scale experiments with rho to be 0.5}
+
+rho <- 0.5
+start_time <- Sys.time()
+lambdas_large <- seq(-40, 40, by = 10)
+
+# u1_grid_large is simply repetition of ones.
+u1_grid_large <- rep(1, length(lambdas_large))
+
+
+grid_out <- run_grid_with_correlation(
+  rho = rho,
+  lambdas = lambdas_large,
+  u1_grid = u1_grid_large,
+  R = 10,
+  iter_warmup = 800, iter_sampling = 600, chains = 2
+)
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+```{r plot the results with rho to be 0.5}
+
+saveRDS(grid_out, file = "data/grid_out_lambda_varying_with_correlation.rds")
+
+p1_lambda_varying_with_correlation <- plot_delta_mean_squared_error(grid_out, x_axis = "lambda")
+
+p2_lambda_varying_with_correlation <- plot_delta_rank_correlation(grid_out, x_axis = "lambda")
+
+p3_lambda_varying_with_correlation <- plot_delta_significant_counts(grid_out, x_axis = "lambda")
+
+p4_lambda_varying_with_correlation <- plot_delta_type_S_errors(grid_out, x_axis = "lambda" , use_typeS = "rate")
+
+(p1_lambda_varying_with_correlation | p2_lambda_varying_with_correlation) / (p3_lambda_varying_with_correlation | p4_lambda_varying_with_correlation) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+ggsave("images/grid_out_lambda_varying_with_correlation.png", width = 10, height = 8)
+
+```
+
+
+```{r run the experiments and plot the results with different rhos}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+
+# ------------------------------------------------------------
+# Runner: fixed u_1, vary rho and lambda
+# ------------------------------------------------------------
+run_rho_lambda_grid <- function(
+  rhos,
+  lambdas,
+  u1_fixed,
+  R = 50, N_per_state = 40, K = 1,
+  A0 = 0.0, A1 = 0.4,
+  Xbar = matrix(c(-0.5, 0.8), nrow = 2, byrow = TRUE),
+  u_0 = 0,
+  sigma_c_treat = 1.0, sigma_c_ctrl = 0.7,
+  mu_delta = 1.0, sigma_delta = 0.6,
+  sigma_y = 1.0, seed0 = 1234,
+  iter_warmup = 500, iter_sampling = 500, chains = 2
+){
+  grid <- tidyr::expand_grid(rho = rhos, lambda = lambdas)
+
+  purrr::pmap_dfr(
+    grid,
+    function(rho, lambda){
+      out <- quick_compare_with_correlation(
+        rho = rho, R = R, N_per_state = N_per_state, K = K,
+        A0 = A0, A1 = A1, Xbar = Xbar,
+        u_1 = u1_fixed, u_0 = u_0,
+        sigma_c_treat = sigma_c_treat, sigma_c_ctrl = sigma_c_ctrl,
+        lambda = lambda, mu_delta = mu_delta, sigma_delta = sigma_delta,
+        sigma_y = sigma_y, seed0 = seed0,
+        iter_warmup = iter_warmup, iter_sampling = iter_sampling, chains = chains
+      )
+      out$DELTA |>
+        mutate(rho = rho, lambda = lambda, u_1 = u1_fixed)
+    }
+  )
+}
+```
+
+
+```{r}
+# ------------------------------------------------------------
+# Plotting helpers (facet by lambda; u1 is fixed)
+# Assumes quick_compare_with_correlation() produced these columns:
+#   rmse_b (BDiD), rmse_f (DiD),
+#   typeS_bayes_did_rate_mean, typeS_did_rate_mean,
+#   n_sig_bayes_did_mean, n_sig_did_mean,
+#   rank_b (BDiD), rank_f (DiD)
+# ------------------------------------------------------------
+
+# ---- 0) Column harmonizer (as before) ----
+harmonize_delta_cols_model_1 <- function(df) {
+  rn <- function(old, new) if (all(old %in% names(df)) && !(new %in% names(df)))
+    df <<- dplyr::rename(df, !!new := dplyr::all_of(old))
+  rn("mse_bayes",  "mse_b");   rn("rmse_bayes","rmse_b"); rn("rank_bayes","rank_b")
+  rn("n_sig_bayes_mean","n_sig_bayes_did_mean")
+  rn("typeS_bayes_count_mean","typeS_bayes_did_count_mean")
+  rn("typeS_bayes_rate_mean","typeS_bayes_did_rate_mean")
+  rn("mse_did","mse_f"); rn("rmse_did","rmse_f"); rn("rank_did","rank_f")
+  if (!"rmse_b"%in%names(df) && "mse_b"%in%names(df)) df$rmse_b <- sqrt(df$mse_b)
+  if (!"rmse_f"%in%names(df) && "mse_f"%in%names(df)) df$rmse_f <- sqrt(df$mse_f)
+  df
+}
+
+# ---- 1) Internal: common scaffolding for rho–λ plots ----
+.make_panel <- function(df, ycols, ylab, point_size, linewidth, rhos = NULL) {
+  df <- harmonize_delta_cols_model_1(df)
+  if (!is.null(rhos)) df <- dplyr::filter(df, rho %in% rhos)
+
+  # long format with method labels
+  long <- df |>
+    dplyr::select(rho, lambda, dplyr::all_of(ycols)) |>
+    tidyr::pivot_longer(cols = dplyr::all_of(ycols),
+                        names_to = "method", values_to = "value") |>
+    dplyr::mutate(method = dplyr::recode(method,
+      "rmse_b"="BDiD","rmse_f"="DiD",
+      "mse_b"="BDiD","mse_f"="DiD",
+      "rank_b"="BDiD","rank_f"="DiD",
+      "n_sig_bayes_did_mean"="BDiD","n_sig_did_mean"="DiD",
+      "typeS_bayes_did_rate_mean"="BDiD","typeS_did_rate_mean"="DiD",
+      "typeS_bayes_did_count_mean"="BDiD","typeS_did_count_mean"="DiD"
+    ))
+
+  # global y-limits across all facets to lock scales
+  y_min <- min(long$value, na.rm = TRUE)
+  y_max <- max(long$value, na.rm = TRUE)
+  # small padding
+  pad <- 0.04 * (y_max - y_min + 1e-9)
+  y_lim <- c(y_min - pad, y_max + pad)
+
+  ggplot(long, aes(x = lambda, y = value, linetype = method, shape = method)) +
+    geom_line(linewidth = linewidth) +
+    geom_point(size = point_size) +
+    scale_linetype_manual(values = c(BDiD = "dashed", DiD = "solid")) +
+    scale_shape_manual(values = c(BDiD = 17, DiD = 16)) +
+    labs(x = expression(lambda), y = ylab, linetype = "Method", shape = "Method") +
+    coord_cartesian(ylim = y_lim) +              # FIXED global y-limit across facets
+    facet_wrap(~ rho, scales = "fixed") +        # one subplot per ρ
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+}
+
+# ---- 2) RMSE(δ_j) vs λ, faceted by ρ ----
+plot_rmse_vs_rho <- function(df, point_size, linewidth, rhos = NULL) {
+  .make_panel(df, ycols = c("rmse_b","rmse_f"), ylab = "RMSE",  point_size, linewidth, rhos = rhos)
+}
+
+# ---- 3) Rank correlation(δ̂_j, δ_j) vs λ, faceted by ρ ----
+plot_rank_vs_rho <- function(df, point_size, linewidth, rhos = NULL) {
+  .make_panel(df, ycols = c("rank_b","rank_f"), ylab = "Spearman rank corr.", point_size = point_size, linewidth = linewidth, rhos = rhos)
+}
+
+# ---- 4) # significant δ_j vs λ, faceted by ρ ----
+plot_nsig_vs_rho <- function(df,  point_size, linewidth, rhos = NULL) {
+  .make_panel(df, ycols = c("n_sig_bayes_did_mean","n_sig_did_mean"),
+              ylab = "Mean # significant", point_size = point_size, linewidth = linewidth, rhos = rhos)
+}
+
+# ---- 5) Type-S errors vs λ, faceted by ρ (choose "rate" or "count") ----
+plot_typeS_vs_rho <- function(df, point_size, linewidth, rhos = NULL, which = c("rate","count")) {
+  which <- match.arg(which)
+  if (which == "rate") {
+    .make_panel(df,
+      ycols = c("typeS_bayes_did_rate_mean","typeS_did_rate_mean"),
+      ylab  = "Type-S error rate",  
+      point_size = point_size, 
+      linewidth = linewidth,
+      rhos  = rhos
+    )
+  } else {
+    .make_panel(df,
+      ycols = c("typeS_bayes_did_count_mean","typeS_did_count_mean"),
+      ylab  = "Mean Type-S error (count)",  
+      point_size = point_size, 
+      linewidth = linewidth,
+      rhos  = rhos
+    )
+  }
+}
+```
+
+
+
+```{r}
+# ------------------------------------------------------------
+# Example
+# ------------------------------------------------------------
+set.seed(2026)
+rhos    <- c(-0.99, -0.9, -0.5, -0.05, -0.01,  0, 0.01,  0.05, 0.5, 0.95, 0.99)
+lambdas <- seq(-100, 100, by = 10)
+u1_fixed <- 1
+#
+
+start_time <- Sys.time()
+df_gl <- run_rho_lambda_grid(
+   rhos = rhos, lambdas = lambdas, u1_fixed = u1_fixed,
+   R = 30, N_per_state = 40,
+   iter_warmup = 400, iter_sampling = 400, chains = 2
+ )
+
+end_time <- Sys.time()
+time_1 <- end_time - start_time
+print(time_1)
+```
+```{r}
+library(patchwork)
+
+df_gl <- harmonize_delta_cols_model_1(df_gl)
+
+# Save the harmonized data
+saveRDS(df_gl, file = file.path("data", "df_gl.rds"))
+readr::write_csv(df_gl, file = file.path("data", "df_gl.csv"))
+
+```
+
+
+```{r}
+
+df_gl <- harmonize_delta_cols_model_1(df_gl)
+p_rmse  <- plot_rmse_vs_rho(df = df_gl, point_size = 1.5, linewidth = 0.7,  rhos =   c(-0.99, -0.9, -0.5, -0.05, -0.01,  0, 0.01,  0.05, 0.5, 0.95, 0.99) )
+p_rank  <- plot_rank_vs_rho(df = df_gl, point_size = 1.5, linewidth = 0.7,  rhos =  c(-0.99, -0.9, -0.5, -0.05, -0.01,  0, 0.01,  0.05, 0.5, 0.95, 0.99))
+p_nsig  <- plot_nsig_vs_rho(df = df_gl, point_size = 1.5, linewidth = 0.7,  rhos =   c(-0.99, -0.9, -0.5, -0.05, -0.01,  0, 0.01,  0.05, 0.5, 0.95, 0.99))
+p_typeS <- plot_typeS_vs_rho(df = df_gl, point_size = 1.5, linewidth = 0.7, rhos =   c(-0.99, -0.9, -0.5, -0.05, -0.01,  0, 0.01,  0.05, 0.5, 0.95, 0.99), which = "rate")
+
+
+
+# ---- Harmonize, subset by rhos of interest, and save the data ----
+
+rhos_to_plot <- c(-0.99, -0.9, -0.5, -0.05, -0.01,  0, 0.01,  0.05, 0.5, 0.95, 0.99)
+
+# Create output folder
+outdir <- "figs_rho_lambda_model_1"
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+```
+
+
+
+```{r}
+
+df_gl <- readRDS("data/df_gl.rds")
+
+```
+
+```{r}
+# ---- Save each separately (PNG + PDF) ----
+ggsave(filename = file.path("images/model1", "rmse_vs_lambda_by_rho.png"),
+       plot = p_rmse, width = 8, height = 6, dpi = 300, bg = "white")
+ggsave(filename = file.path("images/model1", "rmse_vs_lambda_by_rho.pdf"),
+       plot = p_rmse, width = 8, height = 6, device = cairo_pdf, bg = "white")
+
+ggsave(filename = file.path("images/model1", "rankcorr_vs_lambda_by_rho.png"),
+       plot = p_rank, width = 8, height = 6, dpi = 300, bg = "white")
+ggsave(filename = file.path("images/model1", "rankcorr_vs_lambda_by_rho.pdf"),
+       plot = p_rank, width = 8, height = 6, device = cairo_pdf, bg = "white")
+
+ggsave(filename = file.path("images/model1", "nsignificant_vs_lambda_by_rho.png"),
+       plot = p_nsig, width = 8, height = 6, dpi = 300, bg = "white")
+ggsave(filename = file.path("images/model1", "nsignificant_vs_lambda_by_rho.pdf"),
+       plot = p_nsig, width = 8, height = 6, device = cairo_pdf, bg = "white")
+
+ggsave(filename = file.path("images/model1", "typeSrate_vs_lambda_by_rho.png"),
+       plot = p_typeS, width = 8, height = 6, dpi = 300, bg = "white")
+ggsave(filename = file.path("images/model1", "typeSrate_vs_lambda_by_rho.pdf"),
+       plot = p_typeS, width = 8, height = 6, device = cairo_pdf, bg = "white")
+
+p_rmse  
+p_rank  
+p_nsig  
+p_typeS 
+
+```
+
+```{r}
+
+data_correlated <- simulate_data_2x2_one_group_predictor_correlated(rho = -0.99)
+
+cor(data_correlated$truth$c, data_correlated$truth$delta)
+
+```
+```{r}
+corr <- 0.2
+
+n_t <- 10 
+c_i <- rnorm(n_t)
+
+
+df$treated <- rep(ifelse(corr * scale(c_i) + sqrt(1 - corr^2) * rnorm(n_t) > 0, 1, 0), each = n_t)
+	
+```
+
+
+
+
+
+
+
+
