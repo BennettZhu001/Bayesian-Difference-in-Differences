@@ -1,0 +1,1157 @@
+---
+title: "Two_States_Two_Periods"
+output: html_document
+---
+
+
+```{r}
+
+
+```
+
+
+Two states, treated state and control state. $s =0$ for control and $s=1$ for treated. Each state has $N$ counties.
+Two periods, $t=0$ not treated and $t=1$ treated.
+
+Here is the model for $y_{jst}$. Basically, there are three key ingredients in this model: two random effects(county random effects $\gamma_j$ and time random effects $\delta$), group-level predictors $\bar{X}_{s[j]}$, and treatment effects.
+
+
+The group-level predictors capture the group varying intercept and the county random effects $\gamma_j$ accounts for the individual heterogenity not explained by the group-level predictors. $\lambda$ represents the time trend we need to model. In this two-period example, $\lambda$ is just a number. In a longer panel, $\lambda_t$ is a series of numbers could be modeled by iid normal.
+
+$$
+y_{jst}= A_0+ A_1^\top \bar{X}_{s[j]} + \gamma_j + \lambda I_{t=1} + \delta_j Z_{jst} + \epsilon_{jst} 
+$$
+Put usual normal prior on the regression coefficients $A_1$ and intercept $A_0$. Hierarchical normal prior on $\gamma_j$ and $\gamma_j$ has different mean and variance for different groups. Normal prior on $\delta_j$. Normal prior on $\lambda$. 
+
+
+$\epsilon_{jst}$ are all iid normal(0,$\sigma_{y}^2$). 
+
+
+Implement five different estimates:
+
+1. Event Study. Take difference between the mean of treated states from time $1$ and time $0$.
+
+
+$\bar{y}_{s=1,t=1} - \bar{y}_{s=1, t=0} = \bar\delta + \lambda + \bar{\epsilon}_{s=1,t=1} - \bar{\epsilon}_{s=1,t=0}\sim\mathcal{N}(\bar{\delta} + \lambda, \dfrac{2\sigma_{y}^2}{N}) $
+
+2. Difference-in-mean. Take difference between the mean of treated states from time $1$ and mean of control states from time $1$
+
+$$
+\begin{equation}
+\begin{aligned}
+&\bar{y}_{s=1,t=1} - \bar{y}_{s=0, t=1} 
+\\ = &  \bar\delta + A_1^\top (\bar{X}_{s=1} - \bar{X}_{s=0}) + \bar{\gamma}_{s=1} - \bar{\gamma}_{s=0} + \bar{\epsilon}_{s=1,t=1} - \bar{\epsilon}_{s=0,t=1}\\
+\sim & \mathcal{N}(\bar\delta + A_1^\top (\bar{X}_{s=1} - \bar{X}_{s=0}) + \bar{\gamma}_{s=1} - \bar{\gamma}_{s=0}\;,\; \dfrac{2\sigma_{y}^2}{N}) 
+\end{aligned}
+\end{equation}
+$$
+
+
+3. DiD
+
+$$
+\begin{equation}
+\begin{aligned}
+& (\bar{y}_{s=1,t=1} - \bar{y}_{s=1, t=0}) - (\bar{y}_{s=0,t=1} - \bar{y}_{s=0, t=0}) \\
+& = \bar\delta  + \bar{\epsilon}_{s=1,t=1} - \bar{\epsilon}_{s=1,t=0} - (\bar{\epsilon}_{s=0,t=1} - \bar{\epsilon}_{s=0,t=0})\\
+& \sim\mathcal{N}(\bar{\delta} , \dfrac{4\sigma_{y}^2}{N}) 
+\end{aligned}
+\end{equation}
+$$
+
+
+4. Regression DiD controlling for something need to be figured out.
+
+
+
+5. Bayesian DiD.
+
+We expect that conditional on the hyperparameters the Bayesian DiD estimate should be of form of the something subtracted by weighted $\lambda_t$(time trend) and $\bar{\gamma}_{s=1} - \bar{\gamma}_{s=0}$ and $ A_1^\top (\bar{X}_{s=1} - \bar{X}_{s=0})$(the group level variation).
+
+
+
+```{r}
+
+
+# =========================
+# Libraries
+# =========================
+library(cmdstanr)
+library(posterior)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+
+# =========================
+# Compile Stan once
+# =========================
+stan_file <- "Two_States_Two_Periods.stan"
+mod <- cmdstan_model(stan_file)
+
+# =========================
+# Simulation (2x2 with Xbar in gamma-mean and u_s RE)
+# =========================
+simulate_2x2_with_x <- function(N_per_state = 40,
+                                K = 2,
+                                Xbar = NULL,      # S x K matrix (S=2). If NULL, draw N(0,1)
+                                A0 = 0.0,
+                                lambda = 0.5,
+                                mu_delta = 1.0,
+                                tau_delta = 0.6,
+                                alpha_gamma = 0.0,
+                                B = NULL,         # length K; if NULL, draw N(0,0.5)
+                                sigma_u = 0.4,
+                                sigma_gamma = 1.0,
+                                sigma_y = 1.0,
+                                seed = 1) {
+  set.seed(seed)
+  S <- 2L
+  J_t <- N_per_state
+  J_c <- N_per_state
+  J   <- J_t + J_c
+  is_treated <- c(rep(1L, J_t), rep(0L, J_c))
+  state_of_county <- c(rep(1L, J_t), rep(2L, J_c))
+
+  if (is.null(Xbar)) Xbar <- matrix(rnorm(S * K, 0, 1), nrow = S, ncol = K)
+  if (is.null(B))    B    <- rnorm(K, 0, 0.5)
+  u <- rnorm(S, 0, sigma_u)
+
+  # gamma prior mean (by county), then center to match sum-to-zero identification
+  mu_gamma <- alpha_gamma + Xbar[state_of_county, , drop = FALSE] %*% B + u[state_of_county]
+  mu_gamma <- as.numeric(mu_gamma)
+  mu_gamma_cen <- mu_gamma - mean(mu_gamma)
+
+  # draw gamma_j around centered mean, then enforce exact sum-to-zero
+  gamma <- rnorm(J, mean = mu_gamma_cen, sd = sigma_gamma)
+  gamma <- gamma - mean(gamma)
+
+  # deltas: treated counties ~ N(mu_delta, tau_delta^2), controls = 0
+  delta <- rep(0, J)
+  delta[is_treated == 1L] <- rnorm(J_t, mu_delta, tau_delta)
+
+  # 2x2 panel rows
+  county <- rep(seq_len(J), each = 2)
+  post   <- rep(c(0L, 1L), times = J)
+  D      <- is_treated[county] * post
+
+  mu <- A0 + gamma[county] + lambda * post + delta[county] * D
+  y  <- rnorm(2 * J, mu, sigma_y)
+
+  list(
+    stan_data = list(
+      N = length(y), J = J, S = S, K = K,
+      y = y, county = as.integer(county), post = as.integer(post), D = as.integer(D),
+      state_of_county = as.integer(state_of_county),
+      Xbar = Xbar,
+      is_treated = as.integer(is_treated),
+      J_treated = J_t,
+      treated_idx = as.integer(which(is_treated == 1L))
+    ),
+    truth = list(
+      A0 = A0, lambda = lambda, mu_delta = mu_delta, tau_delta = tau_delta,
+      alpha_gamma = alpha_gamma, B = B, u = u, sigma_u = sigma_u,
+      sigma_gamma = sigma_gamma, sigma_y = sigma_y,
+      gamma = gamma, delta = delta, Xbar = Xbar,
+      is_treated = is_treated
+    )
+  )
+}
+
+# =========================
+# Classical estimators (ATT) and per-county d_j
+# =========================
+compute_classical <- function(y, county, post, state, sigma_y, N_per_state) {
+  # cell means
+  y_11 <- mean(y[state == 1 & post == 1])
+  y_10 <- mean(y[state == 1 & post == 0])
+  y_01 <- mean(y[state == 0 & post == 1])
+  y_00 <- mean(y[state == 0 & post == 0])
+
+  # ATT competitors
+  ES_hat  <- y_11 - y_10
+  DM_hat  <- y_11 - y_01
+  DiD_hat <- (y_11 - y_10) - (y_01 - y_00)
+
+  z <- qnorm(0.975)
+  ES_se  <- sqrt(2 * sigma_y^2 / N_per_state)
+  DM_se  <- sqrt(2 * sigma_y^2 / N_per_state)
+  DiD_se <- sqrt(4 * sigma_y^2 / N_per_state)
+
+  list(
+    ES  = c(est = ES_hat,  lo = ES_hat - z * ES_se,  hi = ES_hat + z * ES_se),
+    DM  = c(est = DM_hat,  lo = DM_hat - z * DM_se,  hi = DM_hat + z * DM_se),
+    DiD = c(est = DiD_hat, lo = DiD_hat - z * DiD_se, hi = DiD_hat + z * DiD_se)
+  )
+}
+
+# Per-county DiD contrasts for treated counties:
+# d_j = (y_j11 - y_j10) - (mean_control_1 - mean_control_0)
+compute_per_county_dj <- function(y, county, post, state, sigma_y, N_per_state, treated_ids) {
+  y_c_1 <- mean(y[state == 0 & post == 1])
+  y_c_0 <- mean(y[state == 0 & post == 0])
+
+  est <- numeric(length(treated_ids))
+  lo  <- hi <- est
+
+  z <- qnorm(0.975)
+  # Var(d_j) = Var(y_j11 - y_j10) + Var(mean_c1 - mean_c0) = 2 sigma_y^2 + 2 sigma_y^2 / N
+  se_dj <- sqrt(2 * sigma_y^2 + 2 * sigma_y^2 / N_per_state)
+
+  for (k in seq_along(treated_ids)) {
+    j <- treated_ids[k]
+    y_j1 <- y[county == j & post == 1]
+    y_j0 <- y[county == j & post == 0]
+    dj <- (y_j1 - y_j0) - (y_c_1 - y_c_0)
+    est[k] <- dj
+    lo[k]  <- dj - z * se_dj
+    hi[k]  <- dj + z * se_dj
+  }
+  data.frame(county = treated_ids, est = est, lo = lo, hi = hi)
+}
+
+# =========================
+# Fit Stan once per dataset, extract summaries
+# =========================
+fit_bayes_once <- function(stan_data,
+                           iter_warmup = 750, iter_sampling = 750,
+                           chains = 2, seed = 1234) {
+  
+  outdir <- file.path(getwd(), "cmdstan_out")
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  fit <- mod$sample(
+    data = stan_data,
+    chains = chains, parallel_chains = chains,
+    iter_warmup = iter_warmup, iter_sampling = iter_sampling,
+    refresh = 0, show_messages = FALSE,output_dir = outdir,
+  save_cmdstan_config = TRUE,   # <- key
+  save_warmup = TRUE,                  # ensure CSVs persist
+    seed = seed
+  )
+  dr <- as_draws_df(fit$draws())
+
+  # Scalars
+  ATT_post    <- dr$ATT
+  lambda_post <- dr$lambda
+
+  # Vectors
+  delta_cols <- grep("^delta\\[", names(dr), value = TRUE)
+  gamma_cols <- grep("^gamma\\[", names(dr), value = TRUE)
+
+  list(
+    fit = fit,
+    post = list(
+      ATT    = list(mean = mean(ATT_post),
+                    ci = quantile(ATT_post, c(0.025, 0.975))),
+      lambda = list(mean = mean(lambda_post),
+                    ci = quantile(lambda_post, c(0.025, 0.975))),
+      delta  = list(mean = sapply(delta_cols, \(nm) mean(dr[[nm]])),
+                    lo   = sapply(delta_cols, \(nm) quantile(dr[[nm]], 0.025)),
+                    hi   = sapply(delta_cols, \(nm) quantile(dr[[nm]], 0.975))),
+      gamma  = list(mean = sapply(gamma_cols, \(nm) mean(dr[[nm]])),
+                    lo   = sapply(gamma_cols, \(nm) quantile(dr[[nm]], 0.025)),
+                    hi   = sapply(gamma_cols, \(nm) quantile(dr[[nm]], 0.975)))
+    )
+  )
+}
+
+# =========================
+# One replication wrapper
+# =========================
+one_replication <- function(N_per_state = 40, K = 2, seed = 1,
+                            iter_warmup = 750, iter_sampling = 750, chains = 2) {
+  sim <- simulate_2x2_with_x(N_per_state = N_per_state, K = K, seed = seed)
+
+  # Classical
+  county <- rep(seq_len(sim$stan_data$J), each = 2)
+  post   <- sim$stan_data$post
+  state  <- sim$stan_data$state_of_county - 1L
+  y      <- sim$stan_data$y
+  Nps    <- N_per_state
+  sigy   <- sim$truth$sigma_y
+
+  cls <- compute_classical(y, county, post, state, sigy, Nps)
+  dj  <- compute_per_county_dj(y, county, post, state, sigy, Nps,
+                               treated_ids = which(sim$truth$is_treated == 1L))
+
+  # Bayes
+  fitb <- fit_bayes_once(sim$stan_data,
+                         iter_warmup = iter_warmup, iter_sampling = iter_sampling,
+                         chains = chains, seed = 1000 + seed)
+
+  # --- Metrics ---
+  truth <- sim$truth
+
+  # ATT metrics
+  ATT_true <- mean(truth$delta[truth$is_treated == 1L])
+  att_bayes <- fitb$post$ATT
+  att_metrics <- tibble(
+    method = c("ES","DM","DiD","Bayes"),
+    est    = c(cls$ES["est"], cls$DM["est"], cls$DiD["est"], att_bayes$mean),
+    lo     = c(cls$ES["lo"],  cls$DM["lo"],  cls$DiD["lo"],  att_bayes$ci[1]),
+    hi     = c(cls$ES["hi"],  cls$DM["hi"],  cls$DiD["hi"],  att_bayes$ci[2])
+  ) %>%
+    mutate(true = ATT_true,
+           bias = est - true,
+           sqerr = (est - true)^2,
+           covered = as.integer(true >= lo & true <= hi),
+           width = hi - lo)
+
+  # lambda metrics (only Bayes estimates lambda here)
+  lam_true <- truth$lambda
+  lam <- fitb$post$lambda
+  lambda_metrics <- tibble(
+    method = "Bayes", est = lam$mean, lo = lam$ci[1], hi = lam$ci[2],
+    true = lam_true, bias = est - true, sqerr = (est - true)^2,
+    covered = as.integer(true >= lo & true <= hi), width = hi - lo
+  )
+
+  # Per-county delta metrics (treated counties)
+  treated_ids <- which(truth$is_treated == 1L)
+  # Bayesian
+  d_bayes <- tibble(
+    county = treated_ids,
+    est = fitb$post$delta$mean[treated_ids],
+    lo  = fitb$post$delta$lo[treated_ids],
+    hi  = fitb$post$delta$hi[treated_ids],
+    true = truth$delta[treated_ids]
+  ) %>%
+    mutate(bias = est - true, sqerr = (est - true)^2,
+           covered = as.integer(true >= lo & true <= hi),
+           width = hi - lo,
+           method = "Bayes")
+  # Frequentist per-county (d_j)
+  d_freq <- dj %>%
+    mutate(true = truth$delta[county],
+           bias = est - true, sqerr = (est - true)^2,
+           covered = as.integer(true >= lo & true <= hi),
+           width = hi - lo,
+           method = "Per-county DiD")
+
+  # County FE gamma metrics (Bayes only; compare to truth)
+  g_bayes <- tibble(
+    county = seq_along(truth$gamma),
+    est = fitb$post$gamma$mean,
+    lo  = fitb$post$gamma$lo,
+    hi  = fitb$post$gamma$hi,
+    true = truth$gamma
+  ) %>%
+    mutate(bias = est - true, sqerr = (est - true)^2,
+           covered = as.integer(true >= lo & true <= hi),
+           width = hi - lo,
+           method = "Bayes")
+
+  list(att = att_metrics,
+       lambda = lambda_metrics,
+       delta = bind_rows(d_bayes, d_freq),
+       gamma = g_bayes)
+}
+
+```
+
+
+```{r}
+
+# =========================
+# Run R replications and summarize
+# =========================
+run_simulation <- function(R = 100, N_per_state = 40, K = 2,
+                           iter_warmup = 500, iter_sampling = 500, chains = 2,
+                           seed0 = 123) {
+  res <- vector("list", R)
+  for (r in seq_len(R)) {
+    res[[r]] <- one_replication(
+      N_per_state = N_per_state, K = K, seed = seed0 + r,
+      iter_warmup = iter_warmup, iter_sampling = iter_sampling, chains = chains
+    )
+    if (r %% 5 == 0) cat("Completed", r, "of", R, "\n")
+  }
+  # Bind and summarize
+  ATT_all    <- bind_rows(lapply(res, `[[`, "att"), .id = "rep")
+  LAMBDA_all <- bind_rows(lapply(res, `[[`, "lambda"), .id = "rep")
+  DELTA_all  <- bind_rows(lapply(res, `[[`, "delta"), .id = "rep")
+  GAMMA_all  <- bind_rows(lapply(res, `[[`, "gamma"), .id = "rep")
+
+  # ATT summary across reps
+  att_sum <- ATT_all %>%
+    group_by(method) %>%
+    summarize(
+      mean_est = mean(est),
+      bias = mean(bias),
+      rmse = sqrt(mean(sqerr)),
+      cover95 = mean(covered),
+      avg_width = mean(width),
+      .groups = "drop"
+    )
+
+  # lambda summary (Bayes only)
+  lambda_sum <- LAMBDA_all %>%
+    summarize(
+      mean_est = mean(est),
+      bias = mean(bias),
+      rmse = sqrt(mean(sqerr)),
+      cover95 = mean(covered),
+      avg_width = mean(width)
+    )
+
+  # delta summary (average across treated counties and reps)
+  delta_sum <- DELTA_all %>%
+    group_by(method) %>%
+    summarize(
+      mean_bias = mean(bias),
+      rmse = sqrt(mean(sqerr)),
+      cover95 = mean(covered),
+      avg_width = mean(width),
+      .groups = "drop"
+    )
+
+  # gamma summary (Bayes only; averaged over counties and reps)
+  gamma_sum <- GAMMA_all %>%
+    summarize(
+      mean_bias = mean(bias),
+      rmse = sqrt(mean(sqerr)),
+      cover95 = mean(covered),
+      avg_width = mean(width)
+    )
+
+  list(ATT = att_sum, LAMBDA = lambda_sum, DELTA = delta_sum, GAMMA = gamma_sum,
+       raw = list(ATT = ATT_all, LAMBDA = LAMBDA_all, DELTA = DELTA_all, GAMMA = GAMMA_all))
+}
+```
+
+
+
+```{r}
+# =========================
+# Optional quick plots
+# =========================
+plot_att_summary <- function(att_sum) {
+  ggplot(att_sum, aes(x = method, y = rmse, fill = method)) +
+    geom_col() +
+    geom_text(aes(label = sprintf("bias=%.3f\ncov=%.2f\nw=%.3f", bias, cover95, avg_width)),
+              vjust = -0.3, size = 3) +
+    labs(title = "ATT: RMSE (labels show bias, coverage, CI width)", x = NULL, y = "RMSE") +
+    theme_minimal(base_size = 12) + theme(legend.position = "none")
+}
+
+plot_delta_summary <- function(delta_sum) {
+  ggplot(delta_sum, aes(x = method, y = rmse, fill = method)) +
+    geom_col() +
+    geom_text(aes(label = sprintf("bias=%.3f\ncov=%.2f\nw=%.3f", mean_bias, cover95, avg_width)),
+              vjust = -0.3, size = 3) +
+    labs(title = expression("Per-county "~delta[j]~": RMSE (bias, coverage, width)"),
+         x = NULL, y = "RMSE") +
+    theme_minimal(base_size = 12) + theme(legend.position = "none")
+}
+
+```
+
+
+```{r}
+
+# =========================
+# Example: run 100 reps (adjust MCMC settings as needed)
+# =========================
+# NOTE: 100 MCMC fits can be time-consuming. Start small to smoke test:
+sim_out <- run_simulation(R = 100, N_per_state = 40, K = 2, iter_warmup = 500, iter_sampling = 2000, chains = 2)
+# Then scale up:
+# sim_out <- run_simulation(R = 100, N_per_state = 40, K = 2, iter_warmup = 500, iter_sampling = 500, chains = 2)
+```
+
+
+
+
+
+
+
+
+$$
+y_{jst}= A_0+ A_1^\top \bar{X}_{s[j]} + A_2^\top X_j + \gamma_j + \lambda_t + \delta_j Z_{jst} + \epsilon_{jst} 
+$$
+
+
+
+
+# New trunk of code
+
+```{r}
+# 2×2: one treated state (s=1), one control (s=0)
+simulate_2x2_grouped <- function(N_per_state=40, K=1,
+                                 A0=0.0, A1=0.4,
+                                 Xbar = matrix(c(-0.5, 0.8), nrow=2, byrow=TRUE),
+                                 # state RE scales (truth)
+                                 sigma_u_treat=2, sigma_u_ctrl=1.4,
+                                 # county RE scales by state (truth)
+                                 sigma_c_treat=1.0, sigma_c_ctrl=0.6,
+                                 # treatment & time
+                                 lambda=0.5, mu_delta=3.0, sigma_delta=1.6,
+                                 sigma_y=1.0, seed=1L){
+  set.seed(seed)
+  S <- 2L; J_t <- N_per_state; J_c <- N_per_state; J <- J_t + J_c
+  is_treated <- c(rep(1L,J_t), rep(0L,J_c))
+  state_of_county <- c(rep(1L,J_t), rep(2L,J_c))
+  state_is_treated <- c(1L,0L)
+
+  # truth: u_s and c_j by state group
+  u <- c(rnorm(1,0,sigma_u_treat), rnorm(1,0,sigma_u_ctrl))
+  c <- numeric(J)
+  c[is_treated==1L] <- rnorm(J_t,0,sigma_c_treat)
+  c[is_treated==0L] <- rnorm(J_c,0,sigma_c_ctrl)
+
+  # deltas (treated counties only)
+  delta <- rep(0,J)
+  delta[is_treated==1L] <- rnorm(J_t, mu_delta, sigma_delta)
+
+  # panel rows
+  county <- rep(seq_len(J), each=2)
+  post   <- rep(c(0L,1L), times=J)
+  D      <- is_treated[county]*post
+  s_row  <- state_of_county[county]
+
+  A1_vec <- if (length(A1)==1) rep(A1,K) else as.numeric(A1)
+  lin_x  <- rowSums(Xbar[s_row,,drop=FALSE] *
+                    matrix(A1_vec, nrow=length(s_row), ncol=K, byrow=TRUE))
+
+  mu <- A0 + lin_x + u[s_row] + c[county] + lambda*post + delta[county]*D
+  y  <- rnorm(length(mu), mu, sigma_y)
+
+  list(
+    stan_data = list(
+      N=length(y), J=J, S=2L, K=K, y=y,
+      county=as.integer(county), post=as.integer(post), D=as.integer(D),
+      state_of_county=as.integer(state_of_county),
+      Xbar=Xbar,
+      is_treated=as.integer(is_treated),
+      state_is_treated=as.integer(state_is_treated),
+      J_treated=J_t, treated_idx=as.integer(which(is_treated==1L)),
+      center_c=0L,
+      pool_u_within_group=0L,     # 2×2: no pooling across groups
+      big_sd_u=1e3                # diffuse prior per state
+    ),
+    truth = list(
+      A0=A0, A1=A1_vec, Xbar=Xbar, lambda=lambda, sigma_y=sigma_y,
+      u=u, c=c, is_treated=is_treated, delta=delta,
+      mu_delta=mu_delta, sigma_delta=sigma_delta
+    )
+  )
+}
+
+```
+
+
+
+```{r}
+library(cmdstanr)
+library(posterior)
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+# Classical ATT estimators (+ Wald CIs under homoskedastic σ_y)
+att_classical <- function(y, county, post, state, sigma_y, N_per_state){
+  y_11 <- mean(y[state==1 & post==1]); y_10 <- mean(y[state==1 & post==0])
+  y_01 <- mean(y[state==0 & post==1]); y_00 <- mean(y[state==0 & post==0])
+  ES  <- y_11 - y_10
+  DM  <- y_11 - y_01
+  DiD <- (y_11 - y_10) - (y_01 - y_00)
+  z <- qnorm(0.975)
+  ES_se  <- sqrt(2 * sigma_y^2 / N_per_state)
+  DM_se  <- sqrt(2 * sigma_y^2 / N_per_state)
+  DiD_se <- sqrt(4 * sigma_y^2 / N_per_state)
+  tibble(
+    method = c("ES","DM","DiD"),
+    est    = c(ES, DM, DiD),
+    lo     = c(ES - z*ES_se,  DM - z*DM_se,  DiD - z*DiD_se),
+    hi     = c(ES + z*ES_se,  DM + z*DM_se,  DiD + z*DiD_se)
+  )
+}
+
+# Per-county DiD for treated counties (analytic CI under σ_y)
+per_county_did <- function(y, county, post, state, sigma_y, N_per_state, treated_ids){
+  y_c1 <- mean(y[state==0 & post==1]); y_c0 <- mean(y[state==0 & post==0])
+  z <- qnorm(0.975)
+  se_dj <- sqrt(2*sigma_y^2 + 2*sigma_y^2/N_per_state)
+  map_dfr(treated_ids, function(j){
+    y_j1 <- y[county==j & post==1]; y_j0 <- y[county==j & post==0]
+    dj <- (y_j1 - y_j0) - (y_c1 - y_c0)
+    tibble(county=j, est=dj, lo=dj - z*se_dj, hi=dj + z*se_dj)
+  })
+}
+
+```
+
+
+
+```{r}
+
+# ---- one-time: pick a durable folder for chain CSVs ----
+.default_outdir <- file.path(getwd(), "cmdstan_out")
+if (!dir.exists(.default_outdir)) dir.create(.default_outdir, recursive = TRUE)
+
+fit_bayes_once <- function(stan_data,
+                           treated_idx  = NULL,      # will try stan_data$treated_idx if NULL
+                           delta_name   = "delta",
+                           iter_warmup  = 500,
+                           iter_sampling= 1000,
+                           chains       = 4,
+                           parallel_chains = chains,
+                           seed         = 2025,
+                           output_dir   = .default_outdir,
+                           refresh      = 0) {
+
+  # --- resolve treated indices ---
+  if (is.null(treated_idx)) {
+    treated_idx <- stan_data$treated_idx %||% stan_data$treated_ids
+    if (is.null(treated_idx)) stop("Provide treated_idx or include $treated_idx in stan_data.")
+  }
+  treated_idx <- as.integer(treated_idx)
+  J1 <- length(treated_idx)
+
+  # --- unique chain ids to avoid filename collisions ---
+  chain_ids <- seq_len(chains)
+
+  # --- run sampler with pinned output_dir ---
+  
+  outdir <- file.path(getwd(), "cmdstan_out")
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  fit <- mod$sample(
+    data = stan_data,
+    chains = chains, parallel_chains = chains,
+    iter_warmup = iter_warmup, iter_sampling = iter_sampling,
+    refresh = 0, show_messages = FALSE,output_dir = outdir,
+  save_cmdstan_config = TRUE,   # <- key
+  save_warmup = TRUE,           # optional
+  output_basename = "run1",    # optional: stable filenames
+  seed = seed
+  )
+
+  # --- check CSVs exist & chains returned 0 ---
+  csvs <- fit$output_files(include_failed = TRUE)
+  if (!all(file.exists(csvs))) {
+    message("Some chain CSVs are missing:\n", paste(csvs[!file.exists(csvs)], collapse = "\n"))
+  }
+  rc <- fit$return_codes()
+  if (any(rc != 0L) || !all(file.exists(csvs))) {
+    # print stderr/stdout paths to help debug
+    std_out <- fit$stdout_files()
+    diag_files <- fit$diagnostic_files()
+    message("Nonzero return codes: ", paste(rc, collapse = ", "))
+    message("Stdout files:\n", paste(std_out, collapse = "\n"))
+    message("Diagnostic files:\n", paste(diag_files, collapse = "\n"))
+    # Try a safer rerun (single chain) to surface the underlying error
+    message("Retrying with chains=1, parallel_chains=1, refresh=0 to surface messages...")
+    fit <- mod$sample(
+      data = stan_data,
+      seed = seed + 1L,
+      chains = 1,
+      parallel_chains = 1,
+      chain_ids = 1,
+      iter_warmup = iter_warmup,
+      iter_sampling = iter_sampling,
+      refresh = 0,
+      output_dir = output_dir
+    )
+  }
+
+  # --- extract delta draws ONLY (avoid delta_raw) ---
+  dr_delta <- posterior::as_draws_df(fit$draws(variables = delta_name))
+  delta_cols <- grep(paste0("^", delta_name, "\\[[0-9]+\\]$"),
+                     names(dr_delta), value = TRUE)
+  if (length(delta_cols) == 0) {
+    stop("No columns found for parameter '", delta_name, "'. Check Stan variable names.")
+  }
+
+  j_stan <- as.integer(sub(paste0("^", delta_name, "\\[([0-9]+)\\]$"), "\\1", delta_cols))
+  ord <- order(j_stan)
+  delta_cols <- delta_cols[ord]; j_stan <- j_stan[ord]
+  Delta_mat <- as.matrix(dr_delta[, delta_cols, drop = FALSE])
+
+  # --- handle two cases: delta over ALL counties vs TREATED-only ---
+  if (!is.null(stan_data$J) && length(j_stan) == stan_data$J) {
+    pos_treat <- match(treated_idx, j_stan)
+    if (anyNA(pos_treat)) {
+      stop("Some treated_idx are not present among indices of '", delta_name, "'.")
+    }
+    Delta_tr <- Delta_mat[, pos_treat, drop = FALSE]
+    county_labels <- treated_idx
+  } else if (length(j_stan) == J1 && all(j_stan == seq_len(J1))) {
+    # Stan stored delta only for treated counties
+    Delta_tr <- Delta_mat
+    county_labels <- treated_idx
+  } else {
+    stop("Dimension mismatch: ", delta_name, " has ", length(j_stan),
+         " entries; expected J (all) or J1 (treated).")
+  }
+
+  # --- per-county posteriors (treated only) ---
+  delta_mean <- colMeans(Delta_tr)
+  delta_sd   <- apply(Delta_tr, 2, stats::sd)
+  delta_l95  <- apply(Delta_tr, 2, stats::quantile, probs = 0.025)
+  delta_u95  <- apply(Delta_tr, 2, stats::quantile, probs = 0.975)
+
+  delta_tbl <- tibble::tibble(
+    j   = as.integer(county_labels),
+    est = as.numeric(delta_mean),
+    sd  = as.numeric(delta_sd),
+    lo  = as.numeric(delta_l95),
+    hi  = as.numeric(delta_u95)
+  )
+
+  # --- ATT from the same draws (coherent) ---
+  ATT_draws <- rowMeans(Delta_tr)
+  ATT_mean  <- mean(ATT_draws)
+  ATT_ci    <- stats::quantile(ATT_draws, c(0.025, 0.975), names = FALSE)
+
+  list(
+    ATT = list(mean = ATT_mean, lo = ATT_ci[1], hi = ATT_ci[2], draws = ATT_draws),
+    delta = delta_tbl,
+    output_files = fit$output_files()
+  )
+}
+
+```
+
+
+
+```{r}
+quick_compare <- function(R = 50, N_per_state = 40, K = 1,
+                          A0 = 0.0, A1 = 0.4,
+                          Xbar = matrix(c(-0.5, 0.8), nrow = 2, byrow = TRUE),
+                          sigma_u_treat = 1.4, sigma_u_ctrl = 0.4,
+                          sigma_c_treat = 1.0, sigma_c_ctrl = 0.7,
+                          lambda = 2, mu_delta = 1.0, sigma_delta = 0.6,
+                          sigma_y = 1.0, seed0 = 1234,
+                          iter_warmup = 500, iter_sampling = 500, chains = 2) {
+
+  ATT_rows   <- vector("list", R)
+  DELTA_rows <- vector("list", R)
+
+  for (r in seq_len(R)) {
+    sim <- simulate_2x2_grouped(N_per_state, K, A0, A1, Xbar,
+                                sigma_u_treat, sigma_u_ctrl,
+                                sigma_c_treat, sigma_c_ctrl,
+                                lambda, mu_delta, sigma_delta, sigma_y,
+                                seed = seed0 + r)
+
+    ## classical (ATT + per-county DiD)
+    county <- rep(seq_len(sim$stan_data$J), each = 2)
+    post   <- sim$stan_data$post
+    state  <- sim$stan_data$state_of_county - 1L
+    y      <- sim$stan_data$y
+    Nps    <- N_per_state
+    treated_ids <- which(sim$truth$is_treated == 1L)
+
+    cls  <- att_classical(y, county, post, state, sigma_y, Nps)                    # data.frame with {method, est, lo, hi}
+    dj   <- per_county_did(y, county, post, state, sigma_y, Nps, treated_ids)      # tibble {county, est, lo, hi}
+
+    ## Bayes (per-county posteriors + ATT from the same draws)
+    fitb <- fit_bayes_once(
+      stan_data       = sim$stan_data,
+      treated_idx     = sim$stan_data$treated_idx,
+      iter_warmup     = iter_warmup,
+      iter_sampling   = iter_sampling,
+      chains          = chains,
+      parallel_chains = chains,
+      seed            = seed0 + 10000 + r,
+      refresh         = 0
+    )
+
+    ## --- ATT metrics ---
+    true_ATT <- mean(sim$truth$delta[treated_ids])
+    att_all <- dplyr::bind_rows(
+      cls,
+      tibble::tibble(method = "Bayes", est = fitb$ATT$mean, lo = fitb$ATT$lo, hi = fitb$ATT$hi)
+    ) |>
+      dplyr::mutate(true = true_ATT,
+                    bias = est - true,
+                    sqerr = (est - true)^2,
+                    covered = as.integer(true >= lo & true <= hi),
+                    width = hi - lo)
+    ATT_rows[[r]] <- att_all
+
+    ## --- δ_j metrics (treated counties): DiD vs Bayes ---
+    db <- fitb$delta |>
+      dplyr::filter(j %in% treated_ids) |>
+      dplyr::rename(est_b = est, lo_b = lo, hi_b = hi)
+    df <- dj |>
+      dplyr::rename(j = county, est_f = est, lo_f = lo, hi_f = hi)
+
+    d_join <- dplyr::inner_join(db, df, by = "j") |>
+      dplyr::mutate(
+        truth = sim$truth$delta[j],
+        ## significance (two-sided 5%)
+        sig_b = (lo_b > 0) | (hi_b < 0),
+        sig_f = (lo_f > 0) | (hi_f < 0),
+        ## Type-S indicators among the significant
+        typeS_b = sig_b & (sign(est_b) != sign(truth)),
+        typeS_f = sig_f & (sign(est_f) != sign(truth)),
+        ## squared errors
+        sq_b = (est_b - truth)^2,
+        sq_f = (est_f - truth)^2
+      )
+
+    n_sig_b <- sum(d_join$sig_b)
+    n_sig_f <- sum(d_join$sig_f)
+    typeS_cnt_b <- sum(d_join$typeS_b)
+    typeS_cnt_f <- sum(d_join$typeS_f)
+
+    DELTA_rows[[r]] <- tibble::tibble(
+      ## Counts
+      n_sig_b = n_sig_b,
+      n_sig_f = n_sig_f,
+      ## Type-S counts and rates (NA if no significant)
+      typeS_b_count = typeS_cnt_b,
+      typeS_f_count = typeS_cnt_f,
+      typeS_b_rate  = ifelse(n_sig_b > 0, typeS_cnt_b / n_sig_b, NA_real_),
+      typeS_f_rate  = ifelse(n_sig_f > 0, typeS_cnt_f / n_sig_f, NA_real_),
+      ## MSE and RMSE
+      mse_b   = mean(d_join$sq_b),
+      mse_f   = mean(d_join$sq_f),
+      rmse_b  = sqrt(mean(d_join$sq_b)),
+      rmse_f  = sqrt(mean(d_join$sq_f)),
+      ## Coverage and average width (kept for completeness)
+      cover_b = mean(d_join$truth >= db$lo_b & d_join$truth <= db$hi_b),
+      cover_f = mean(d_join$truth >= df$lo_f & d_join$truth <= df$hi_f),
+      width_b = mean(db$hi_b - db$lo_b),
+      width_f = mean(df$hi_f - df$lo_f),
+      ## Spearman rank correlations
+      rank_b  = suppressWarnings(cor(d_join$est_b, d_join$truth, method = "spearman")),
+      rank_f  = suppressWarnings(cor(d_join$est_f, d_join$truth, method = "spearman"))
+    )
+  }
+
+  ATT_all   <- dplyr::bind_rows(ATT_rows)
+  DELTA_all <- dplyr::bind_rows(DELTA_rows)
+
+  att_sum <- ATT_all |>
+    dplyr::group_by(method) |>
+    dplyr::summarize(
+      rmse = sqrt(mean(sqerr)),
+      mse  = mean(sqerr),
+      bias = mean(bias),
+      cover95 = mean(covered),
+      avg_width = mean(width),
+      .groups = "drop"
+    )
+
+  delta_sum <- DELTA_all |>
+    dplyr::summarize(
+      ## Bayes
+      n_sig_b_mean = mean(n_sig_b),
+      typeS_b_count_mean = mean(typeS_b_count),
+      typeS_b_rate_mean  = mean(typeS_b_rate, na.rm = TRUE),
+      mse_b = mean(mse_b), rmse_b = mean(rmse_b),
+      cover_b = mean(cover_b), width_b = mean(width_b),
+      rank_b  = mean(rank_b, na.rm = TRUE),
+      ## DiD
+      n_sig_f_mean = mean(n_sig_f),
+      typeS_f_count_mean = mean(typeS_f_count),
+      typeS_f_rate_mean  = mean(typeS_f_rate, na.rm = TRUE),
+      mse_f = mean(mse_f), rmse_f = mean(rmse_f),
+      cover_f = mean(cover_f), width_f = mean(width_f),
+      rank_f  = mean(rank_f, na.rm = TRUE)
+    )
+
+  list(ATT = att_sum,
+       DELTA = delta_sum,
+       ATT_raw = ATT_all,
+       DELTA_raw = DELTA_all)
+}
+
+
+```
+
+
+
+```{r}
+library(purrr); library(dplyr); library(tidyr)
+
+run_grid <- function(lambdas, A_grid, R = 50, N_per_state = 40, ...) {
+  map2_dfr(lambdas, A_grid, \(lam, a1) {
+    res <- quick_compare(R = R, N_per_state = N_per_state, A1 = a1, lambda = lam, ...)
+    # Flatten: keep only delta summaries for plotting the 4 quantities
+    tibble(lambda = lam, A1 = a1) |>
+      bind_cols(res$DELTA)
+  })
+}
+
+# Example:
+# lambdas <- seq(0, 2, by = 0.25)
+# A_grid  <- rep(0.4, length(lambdas))   # hold A1 fixed, or vary if you want
+# grid_out <- run_grid(lambdas, A_grid, R = 50, iter_warmup = 300, iter_sampling = 600, chains = 2)
+
+
+
+```
+
+
+```{r}
+
+library(ggplot2)
+
+plot_delta_metrics <- function(grid_out, facet_by = NULL, use_typeS = c("count","rate")) {
+  use_typeS <- match.arg(use_typeS)
+  df <- grid_out
+
+  # rename columns to a common long form for plotting
+  long_list <- list(
+    n_sig   = df |> select(lambda, {{facet_by}}, n_sig_b_mean, n_sig_f_mean) |>
+      pivot_longer(cols = c(n_sig_b_mean, n_sig_f_mean),
+                   names_to = "method", values_to = "value") |>
+      mutate(metric = "Number significant",
+             method = ifelse(method == "n_sig_b_mean", "Bayes", "DiD")),
+    typeS   = {
+      if (use_typeS == "count") {
+        df |> select(lambda, {{facet_by}}, typeS_b_count_mean, typeS_f_count_mean) |>
+          pivot_longer(cols = c(typeS_b_count_mean, typeS_f_count_mean),
+                       names_to = "method", values_to = "value") |>
+          mutate(metric = "Type-S (count)",
+                 method = ifelse(method == "typeS_b_count_mean", "Bayes", "DiD"))
+      } else {
+        df |> select(lambda, {{facet_by}}, typeS_b_rate_mean, typeS_f_rate_mean) |>
+          pivot_longer(cols = c(typeS_b_rate_mean, typeS_f_rate_mean),
+                       names_to = "method", values_to = "value") |>
+          mutate(metric = "Type-S (rate)",
+                 method = ifelse(method == "typeS_b_rate_mean", "Bayes", "DiD"))
+      }
+    },
+    mse     = df |> select(lambda, {{facet_by}}, mse_b, mse_f) |>
+      pivot_longer(cols = c(mse_b, mse_f),
+                   names_to = "method", values_to = "value") |>
+      mutate(metric = "MSE", method = ifelse(method == "mse_b", "Bayes", "DiD")),
+    rank    = df |> select(lambda, {{facet_by}}, rank_b, rank_f) |>
+      pivot_longer(cols = c(rank_b, rank_f),
+                   names_to = "method", values_to = "value") |>
+      mutate(metric = "Spearman ρ", method = ifelse(method == "rank_b", "Bayes", "DiD"))
+  )
+
+  plot_df <- bind_rows(long_list)
+
+  p <- ggplot(plot_df, aes(x = lambda, y = value, linetype = method, shape = method)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.8) +
+    scale_linetype_manual(values = c(Bayes = "dashed", DiD = "solid")) +
+    scale_shape_manual(values = c(Bayes = 17, DiD = 16)) +
+    labs(x = expression(lambda), y = NULL, linetype = "Method", shape = "Method") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom") +
+    facet_wrap(~ metric, scales = "free_y", ncol = 2)
+
+  # Optional facet by A1/A2 if it varies
+  if (!is.null(facet_by)) {
+    p <- p + facet_grid(rows = vars(metric), cols = vars(!!rlang::sym(facet_by)),
+                        scales = "free_y")
+  }
+  p
+}
+```
+
+```{r}
+# Example usage:
+
+#Example:
+lambdas <- seq(0, 2, by = 0.25)
+A_grid  <- rep(0.4, length(lambdas))   # hold A1 fixed, or vary if you want
+grid_out <- run_grid(lambdas, A_grid, R = 1, iter_warmup = 300, iter_sampling = 600, chains = 2)
+p <- plot_delta_metrics(grid_out, facet_by = "A1", use_typeS = "rate")
+print(p)
+
+```
+
+produce the same four plots as the chicken paper.
+
+About ATT.
+
+
+Five competitors:
+
++ Event study with standard error
++ Difference-in-means with standard error
++ Regression DiD with standard error(no covariates/predictors)
++ Regression DiD control for group-level predictors with standard error
+
+
++ Bayesian DiD posterior draws. posterior mean with credible interval
+
+
+
+Does this make sense?
++ Regression DiD control for individual-level predictors
+
+How about the Regression DiD control for group-level predictors
+
+
+About $\delta_j$
+
++ regression DiD(TWFE regression) to get ATT and standard deviation of the noise. Then get the $\har{\delta}_j$ by subtracting individual by the group mean with standard error.
+
++ Bayesian DiD posterior mean. Posterior mean with credible interval.
+
+
+
+
++ number of statistical significant estimates of treatment effects
++ type S error rate. number of number of statistical significant estimates with the opposite sign
++ root mean squared error
++ rank correlation of estimates with truth
+
+
+## run simulations
+
+```{r}
+# Make sure 'mod' is compiled from did_decomposed_m0plus_grouped.stan
+set.seed(1)
+
+# time trends: lambda is small
+# difference between treated and control is also small
+# in this case, DiD is expensive.
+
+#cmp <- quick_compare(R = 100, N_per_state = 40, lambda = 0.5)
+
+lambdas <- 0.3*seq_len(10)
+
+A1s <- 0.2*seq_len(10)
+
+cmps <- list()
+
+for (r in seq_along(lambdas)) {
+  cmps[[length(cmps) + 1L]] <- quick_compare(R = 100, N_per_state = 20,
+                                             A1 = A1s[r], lambda = lambdas[r])
+}
+
+
+```
+
+
+
+```{r}
+print(cmp)
+```
+
+
+
+
+
+```{r}
+
+for (r in seq_along(lambdas)){
+  
+  print(cmps[r]$ATT)
+}
+```
+
+```{r}
+
+lambdas <- 0.3*seq_len(10)
+
+A1s <- 0.2*seq_len(10)
+
+print(cmps[[1]]$ATT[1:4])
+```
+
+```{r}
+print(cmps[[4]]$ATT[1:3])
+print(lambdas[4])
+
+
+```
+
+
+
+
+
+```{r}
+library(tibble)
+
+# Compute true biases for ES and DM given lambda and A1
+# Xbar: 2 x K matrix of state-level predictor means (row 1 = control s=0, row 2 = treated s=1)
+# A1s:  either a numeric vector (when K=1), or a matrix with one row per scenario (when K>1)
+# u_gap: scalar = (u_1 - u_0); default 0
+true_bias_table <- function(lambdas, A1s, Xbar, u_gap = 0) {
+  stopifnot(nrow(Xbar) == 2)
+  deltaX <- as.numeric(Xbar[2, ] - Xbar[1, ])   # length K
+
+  # Compute DM bias across scenarios
+  if (length(deltaX) == 1L) {
+    # K = 1: A1s is a numeric vector of coefficients
+    dm_bias <- as.numeric(A1s) * deltaX + u_gap
+    A1_label <- as.numeric(A1s)
+  } else {
+    # K > 1: A1s must be a matrix with rows = scenarios and K columns
+    if (!is.matrix(A1s)) {
+      stop("When K > 1, provide A1s as a matrix with one row per scenario and ", 
+           ncol = length(deltaX), " columns.")
+    }
+    if (ncol(A1s) != length(deltaX)) {
+      stop("ncol(A1s) must equal ncol(Xbar) when K > 1.")
+    }
+    dm_bias <- as.numeric(A1s %*% deltaX) + u_gap
+    # Simple label: paste coefficients; you can customize as needed
+    A1_label <- apply(A1s, 1, \(row) paste0("(", paste(signif(row, 3), collapse = ", "), ")"))
+  }
+
+  if (length(dm_bias) != length(lambdas)) {
+    stop("Lengths of 'lambdas' and the number of A1 scenarios must match.")
+  }
+
+  tibble(
+    lambda  = as.numeric(lambdas),
+    A1      = A1_label,
+    bias_ES = as.numeric(lambdas),  # ES bias = lambda
+    bias_DM = as.numeric(dm_bias)   # DM bias = A1^T (X1 - X0) + u_gap
+  )
+}
+
+# Pretty-print the first n rows (like your example)
+print_true_bias <- function(lambdas, A1s, Xbar, u_gap = 0, n = 4) {
+  tab <- true_bias_table(lambdas, A1s, Xbar, u_gap)
+  print(head(tab, n))
+  invisible(tab)
+}
+
+  
+                                               
+                                               
+
+```
+
+
+```{r}
+lambdas <- 0.3 * seq_len(10)
+A1s     <- 0.2 * seq_len(10)
+Xbar    <- matrix(c(-0.5, 0.8), nrow = 2, byrow = TRUE)  # K = 1
+# optional: u_gap = u1 - u0 (set to, say, 0.7 if you want DM to be biased by 0.7 even when A1=0)
+u_gap   <- 0
+
+# Compute and print first 4 rows
+tab <- print_true_bias(lambdas, A1s, Xbar, u_gap, n = 10)
+# If you want the full table:
+# tab <- true_bias_table(lambdas, A1s, Xbar, u_gap)
+
+```
+
+
+
+```{r}
+for (i in seq_len(10)){
+  print(cmps[[i]]$ATT[1:3])
+}
+```
+
+```{r}
+
+print(cmp$DELTA_raw)
+```
+
+
+
+```{r}
+# δ_j (treated counties): Bayes vs per-county DiD (aggregated)
+print(cmp$DELTA)
+
+
+```
+
+
